@@ -1,0 +1,2187 @@
+Understood — dropping NocoBase entirely. Next.js (App Router) as the full-stack application layer, npm as package manager, PostgreSQL as the source of truth, Drizzle as the ORM against the schema you already have.
+
+## SECTION 1: ARCHITECTURE
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Cloudflare → NGINX (TLS, rate limit, mTLS on /ra/*)         │
+├──────────────────────────────────────────────────────────────┤
+│  Next.js 15 (App Router) — Node runtime, standalone output   │
+│  ├─ /(admin)   staff console      → RSC + Server Actions     │
+│  ├─ /(portal)  client portal      → RSC + Server Actions     │
+│  ├─ /api/v1/*  REST (Hono)        → external + n8n           │
+│  └─ /api/webhooks/* (Stripe, GlobalSign, DocuSign)           │
+├──────────────────────────────────────────────────────────────┤
+│  packages/db (Drizzle) │ packages/auth │ packages/policy      │
+│  packages/storage      │ packages/jobs │ packages/crypto      │
+├──────────────────────────────────────────────────────────────┤
+│  PG 16 (RLS) │ Redis (sessions/queue) │ MinIO │ pgvector      │
+├──────────────────────────────────────────────────────────────┤
+│  Worker (BullMQ, separate container) │ pg_cron (in-DB)        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**The load-bearing decision:** every request runs as a *scoped* PG connection with `app.actor_id` / `app.tenant_id` set. RLS is not a backstop — it's the primary authorization boundary. Application code cannot bypass it because the app role has no `BYPASSRLS`.
+
+```
+intune/
+├─ apps/
+│  ├─ web/                  # Next.js
+│  └─ worker/               # BullMQ processor
+├─ packages/
+│  ├─ db/                   # Drizzle schema, client, RLS scoping
+│  ├─ auth/                 # sessions, MFA, Entra OIDC
+│  ├─ policy/               # CASL abilities + SoD engine
+│  ├─ crypto/               # pgcrypto envelope, hashing, signing
+│  ├─ storage/              # MinIO presign, AV scan
+│  ├─ jobs/                 # queue defs + processors
+│  ├─ contracts/            # zod schemas shared client/server
+│  └─ observability/        # pino, OTel
+├─ sql/                     # 00–99 migrations from prior build
+├─ docker-compose.yml
+└─ package.json
+```
+
+---
+
+## SECTION 2: WORKSPACE
+
+```json
+// package.json
+{
+  "name": "intune-erp",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "engines": { "node": ">=22.0.0", "npm": ">=10.0.0" },
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/web",
+    "dev:worker": "npm run dev --workspace=apps/worker",
+    "build": "npm run build --workspaces --if-present",
+    "db:generate": "drizzle-kit generate --config=packages/db/drizzle.config.ts",
+    "db:migrate": "tsx packages/db/src/migrate.ts",
+    "db:push": "drizzle-kit push --config=packages/db/drizzle.config.ts",
+    "db:studio": "drizzle-kit studio --config=packages/db/drizzle.config.ts",
+    "sql:apply": "bash scripts/apply-sql.sh",
+    "typecheck": "tsc --build",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.30.1",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
+```
+
+```json
+// apps/web/package.json
+{
+  "name": "@intune/web",
+  "scripts": {
+    "dev": "next dev --turbo",
+    "build": "next build",
+    "start": "node .next/standalone/server.js"
+  },
+  "dependencies": {
+    "@intune/auth": "*", "@intune/contracts": "*", "@intune/crypto": "*",
+    "@intune/db": "*", "@intune/jobs": "*", "@intune/observability": "*",
+    "@intune/policy": "*", "@intune/storage": "*",
+    "@casl/ability": "^6.7.2",
+    "@hono/zod-validator": "^0.4.2",
+    "@tanstack/react-query": "^5.62.7",
+    "@tanstack/react-table": "^8.20.5",
+    "date-fns": "^4.1.0",
+    "hono": "^4.6.14",
+    "lucide-react": "^0.469.0",
+    "next": "^15.1.3",
+    "next-safe-action": "^7.10.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-hook-form": "^7.54.2",
+    "zod": "^3.24.1"
+  }
+}
+```
+
+```json
+// packages/db/package.json
+{
+  "name": "@intune/db",
+  "main": "./src/index.ts",
+  "dependencies": {
+    "drizzle-orm": "^0.38.3",
+    "pg": "^8.13.1",
+    "postgres": "^3.4.5"
+  }
+}
+```
+
+---
+
+## SECTION 3: DATABASE LAYER — RLS-SCOPED CLIENT
+
+This is the most important file in the codebase. Everything else depends on it being correct.
+
+```typescript
+// packages/db/src/client.ts
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { Pool, type PoolClient } from 'pg';
+import { sql } from 'drizzle-orm';
+import * as schema from './schema/index.js';
+
+// ── Admin pool: migrations, cron, system tasks. BYPASSES RLS. Never web-facing.
+const adminPool = new Pool({
+  connectionString: process.env.DATABASE_URL_ADMIN,
+  max: 5,
+  ssl: { rejectUnauthorized: true, ca: process.env.PG_CA_CERT },
+});
+
+// ── App pool: every request. Role has NO BYPASSRLS.
+const appPool = new Pool({
+  connectionString: process.env.DATABASE_URL_APP,
+  max: Number(process.env.PG_POOL_MAX ?? 20),
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 5_000,
+  statement_timeout: 30_000,
+  ssl: { rejectUnauthorized: true, ca: process.env.PG_CA_CERT },
+});
+
+export const dbAdmin: NodePgDatabase<typeof schema> = drizzle(adminPool, { schema });
+
+export interface ActorContext {
+  actorId: string;
+  tenantId: string;
+  requestId?: string;
+  clientIp?: string;
+}
+
+/**
+ * Runs `fn` inside a transaction with session GUCs bound to the actor.
+ * set_config(..., true) = transaction-local → cannot leak across pooled connections.
+ * This is the ONLY sanctioned path for request-scoped DB access.
+ */
+export async function withActor<T>(
+  ctx: ActorContext,
+  fn: (tx: NodePgDatabase<typeof schema>) => Promise<T>,
+): Promise<T> {
+  const conn: PoolClient = await appPool.connect();
+  try {
+    await conn.query('BEGIN');
+    await conn.query(
+      `SELECT set_config('app.actor_id', $1, true),
+              set_config('app.tenant_id', $2, true),
+              set_config('app.request_id', $3, true)`,
+      [ctx.actorId, ctx.tenantId, ctx.requestId ?? ''],
+    );
+    const tx = drizzle(conn, { schema });
+    const result = await fn(tx);
+    await conn.query('COMMIT');
+    return result;
+  } catch (err) {
+    await conn.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/** Unauthenticated reads (login lookup, share-link resolution). Explicit and rare. */
+export async function withAnon<T>(
+  fn: (tx: NodePgDatabase<typeof schema>) => Promise<T>,
+): Promise<T> {
+  const conn = await appPool.connect();
+  try {
+    await conn.query('BEGIN');
+    await conn.query(`SELECT set_config('app.actor_id', '', true)`);
+    const r = await fn(drizzle(conn, { schema }));
+    await conn.query('COMMIT');
+    return r;
+  } catch (e) {
+    await conn.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+export async function healthcheck(): Promise<boolean> {
+  try {
+    const r = await appPool.query('SELECT 1 AS ok');
+    return r.rows[0]?.ok === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function shutdown() {
+  await Promise.all([appPool.end(), adminPool.end()]);
+}
+
+export { schema, sql };
+export type Db = NodePgDatabase<typeof schema>;
+```
+
+**Drizzle schema** — mirrors the SQL exactly. Abbreviated to the representative shape; the pattern repeats across all ten schemas.
+
+```typescript
+// packages/db/src/schema/core.ts
+import {
+  pgSchema, uuid, text, boolean, timestamp, jsonb, integer,
+  pgEnum, index, uniqueIndex, primaryKey, inet, bigserial,
+} from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+
+export const core = pgSchema('core');
+
+export const recordStatus = core.enum('record_status',
+  ['draft', 'active', 'inactive', 'archived', 'deleted']);
+export const riskRating = core.enum('risk_rating',
+  ['low', 'moderate', 'elevated', 'high', 'critical']);
+
+/** Every audited table carries this. Mirrors the DB trigger contract. */
+export const auditCols = {
+  createdBy: uuid('created_by'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid('updated_by'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  recordStatus: recordStatus('record_status').notNull().default('active'),
+};
+
+export const tenant = core.table('tenant', {
+  tenantId: uuid('tenant_id').primaryKey().defaultRandom(),
+  tenantCode: text('tenant_code').notNull().unique(),
+  legalName: text('legal_name').notNull(),
+  isInternal: boolean('is_internal').notNull().default(false),
+  ...auditCols,
+});
+
+export const appUser = core.table('app_user', {
+  userId: uuid('user_id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenant.tenantId),
+  email: text('email').notNull(),
+  fullName: text('full_name').notNull(),
+  phone: text('phone'),
+  isStaff: boolean('is_staff').notNull().default(false),
+  mfaEnrolled: boolean('mfa_enrolled').notNull().default(false),
+  entraOid: text('entra_oid').unique(),
+  lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
+  ...auditCols,
+}, (t) => [uniqueIndex('uq_user_email').on(t.tenantId, t.email)]);
+
+export const role = core.table('role', {
+  roleId: uuid('role_id').primaryKey().defaultRandom(),
+  roleCode: text('role_code').notNull().unique(),
+  roleName: text('role_name').notNull(),
+  scope: text('scope').notNull(),
+  description: text('description'),
+  ...auditCols,
+});
+
+export const permission = core.table('permission', {
+  permissionId: uuid('permission_id').primaryKey().defaultRandom(),
+  permCode: text('perm_code').notNull().unique(),
+  resource: text('resource').notNull(),
+  action: text('action').notNull(),
+  description: text('description'),
+});
+
+export const rolePermission = core.table('role_permission', {
+  roleId: uuid('role_id').notNull().references(() => role.roleId, { onDelete: 'cascade' }),
+  permissionId: uuid('permission_id').notNull()
+    .references(() => permission.permissionId, { onDelete: 'cascade' }),
+}, (t) => [primaryKey({ columns: [t.roleId, t.permissionId] })]);
+
+export const userRole = core.table('user_role', {
+  userId: uuid('user_id').notNull().references(() => appUser.userId, { onDelete: 'cascade' }),
+  roleId: uuid('role_id').notNull().references(() => role.roleId, { onDelete: 'cascade' }),
+  grantedBy: uuid('granted_by'),
+  grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+}, (t) => [primaryKey({ columns: [t.userId, t.roleId] })]);
+
+export const sodConflict = core.table('sod_conflict', {
+  sodId: uuid('sod_id').primaryKey().defaultRandom(),
+  roleAId: uuid('role_a_id').notNull().references(() => role.roleId),
+  roleBId: uuid('role_b_id').notNull().references(() => role.roleId),
+  severity: riskRating('severity').notNull().default('high'),
+  rationale: text('rationale').notNull(),
+});
+
+export const notification = core.table('notification', {
+  notificationId: uuid('notification_id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenant.tenantId),
+  userId: uuid('user_id').references(() => appUser.userId),
+  channel: text('channel').notNull(),
+  subject: text('subject'),
+  body: text('body'),
+  payload: jsonb('payload').$type<Record<string, unknown>>(),
+  status: text('status').notNull().default('queued'),
+  attempts: integer('attempts').notNull().default(0),
+  sendAfter: timestamp('send_after', { withTimezone: true }).notNull().defaultNow(),
+  sentAt: timestamp('sent_at', { withTimezone: true }),
+  errorText: text('error_text'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('ix_notif_pending').on(t.status, t.sendAfter)]);
+
+export const auditLog = core.table('audit_log', {
+  auditId: bigserial('audit_id', { mode: 'bigint' }).primaryKey(),
+  tenantId: uuid('tenant_id'),
+  actorId: uuid('actor_id'),
+  action: text('action').notNull(),
+  schemaName: text('schema_name').notNull(),
+  tableName: text('table_name').notNull(),
+  recordPk: text('record_pk').notNull(),
+  oldData: jsonb('old_data'),
+  newData: jsonb('new_data'),
+  changedFields: text('changed_fields').array(),
+  clientIp: inet('client_ip'),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  rowHash: text('row_hash'),
+  prevHash: text('prev_hash'),
+});
+```
+
+```typescript
+// packages/db/src/schema/frame.ts  (representative — the framework layer)
+import { pgSchema, uuid, text, integer, numeric, boolean, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { auditCols, riskRating } from './core.js';
+import { engagement } from './engage.js';
+
+export const frame = pgSchema('frame');
+
+export const examRating = frame.enum('exam_rating',
+  ['effective', 'partially_effective', 'deficient', 'critical_exposure']);
+export const evidenceTier = frame.enum('evidence_tier',
+  ['tier_i', 'tier_ii', 'tier_iii', 'tier_iv']);
+
+export const framework = frame.table('framework', {
+  frameworkId: uuid('framework_id').primaryKey().defaultRandom(),
+  frameworkCode: text('framework_code').notNull().unique(),
+  frameworkName: text('framework_name').notNull(),
+  version: text('version').notNull().default('1.0'),
+  purpose: text('purpose'),
+  coreQuestion: text('core_question'),
+  isProprietary: boolean('is_proprietary').notNull().default(true),
+  ...auditCols,
+});
+
+export const assessment = frame.table('assessment', {
+  assessmentId: uuid('assessment_id').primaryKey().defaultRandom(),
+  tenantId: uuid('tenant_id').notNull(),
+  engagementId: uuid('engagement_id').notNull().references(() => engagement.engagementId),
+  frameworkId: uuid('framework_id').notNull().references(() => framework.frameworkId),
+  assessmentNumber: text('assessment_number').notNull().unique(),
+  periodStart: text('period_start').notNull(),
+  periodEnd: text('period_end').notNull(),
+  asOfDate: text('as_of_date').notNull(),
+  status: text('status').notNull().default('planning'),
+  overallRating: examRating('overall_rating'),
+  maturityScore: numeric('maturity_score', { precision: 3, scale: 2 }),
+  leadAssessor: uuid('lead_assessor'),
+  qaReviewer: uuid('qa_reviewer'),
+  issuedAt: timestamp('issued_at', { withTimezone: true }),
+  ...auditCols,
+});
+
+export const workpaper = frame.table('workpaper', {
+  workpaperId: uuid('workpaper_id').primaryKey().defaultRandom(),
+  assessmentId: uuid('assessment_id').notNull()
+    .references(() => assessment.assessmentId, { onDelete: 'cascade' }),
+  procedureId: uuid('procedure_id').notNull(),
+  wpReference: text('wp_reference').notNull(),
+  populationSize: integer('population_size'),
+  sampleSize: integer('sample_size'),
+  sampleMethod: text('sample_method'),
+  workPerformed: text('work_performed'),
+  result: examRating('result'),
+  exceptionsNoted: integer('exceptions_noted').notNull().default(0),
+  conclusion: text('conclusion'),
+  preparedBy: uuid('prepared_by'),
+  preparedAt: timestamp('prepared_at', { withTimezone: true }),
+  reviewedBy: uuid('reviewed_by'),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  isLocked: boolean('is_locked').notNull().default(false),
+  ...auditCols,
+}, (t) => [uniqueIndex('uq_wp_ref').on(t.assessmentId, t.wpReference)]);
+
+export const evidence = frame.table('evidence', {
+  evidenceId: uuid('evidence_id').primaryKey().defaultRandom(),
+  workpaperId: uuid('workpaper_id').notNull()
+    .references(() => workpaper.workpaperId, { onDelete: 'cascade' }),
+  documentId: uuid('document_id'),
+  evidenceRef: text('evidence_ref').notNull(),
+  description: text('description').notNull(),
+  tier: evidenceTier('tier').notNull(),
+  source: text('source').notNull(),
+  obtainedAt: timestamp('obtained_at', { withTimezone: true }).notNull().defaultNow(),
+  obtainedBy: uuid('obtained_by'),
+  sha256Hash: text('sha256_hash'),
+  isSufficient: boolean('is_sufficient'),
+  reliabilityNotes: text('reliability_notes'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('ix_evidence_wp').on(t.workpaperId, t.tier)]);
+
+export const finding = frame.table('finding', {
+  findingId: uuid('finding_id').primaryKey().defaultRandom(),
+  assessmentId: uuid('assessment_id').notNull()
+    .references(() => assessment.assessmentId, { onDelete: 'cascade' }),
+  workpaperId: uuid('workpaper_id').references(() => workpaper.workpaperId),
+  objectiveId: uuid('objective_id'),
+  findingNumber: text('finding_number').notNull(),
+  title: text('title').notNull(),
+  condition: text('condition').notNull(),
+  criteria: text('criteria').notNull(),
+  cause: text('cause'),
+  effect: text('effect'),
+  recommendation: text('recommendation').notNull(),
+  severity: riskRating('severity').notNull(),
+  rating: examRating('rating').notNull(),
+  mgmtResponse: text('mgmt_response'),
+  mgmtOwner: text('mgmt_owner'),
+  targetRemediationDate: text('target_remediation_date'),
+  status: text('status').notNull().default('open'),
+  validatedBy: uuid('validated_by'),
+  validatedAt: timestamp('validated_at', { withTimezone: true }),
+  ...auditCols,
+}, (t) => [uniqueIndex('uq_finding_num').on(t.assessmentId, t.findingNumber)]);
+```
+
+---
+
+## SECTION 4: AUTH
+
+Custom sessions rather than NextAuth — you need MFA enforcement, SoD checks at grant time, and Entra ID federation with tight control over the token exchange. NextAuth fights you on all three.
+
+```typescript
+// packages/auth/src/session.ts
+import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { cookies } from 'next/headers';
+import { redis } from './redis.js';
+
+const SESSION_COOKIE = '__Host-intune_sid';
+const SESSION_TTL = 60 * 60 * 8;        // 8h absolute
+const IDLE_TTL = 60 * 30;               // 30m idle
+
+export interface Session {
+  sid: string;
+  userId: string;
+  tenantId: string;
+  isStaff: boolean;
+  mfaVerified: boolean;
+  permissions: string[];
+  roles: string[];
+  visibleClientIds: string[];
+  issuedAt: number;
+  absoluteExpiry: number;
+  ip: string;
+  ua: string;
+}
+
+const hashSid = (raw: string) => createHash('sha256').update(raw).digest('hex');
+
+export async function createSession(
+  data: Omit<Session, 'sid' | 'issuedAt' | 'absoluteExpiry'>,
+): Promise<string> {
+  const raw = randomBytes(32).toString('base64url');
+  const sid = hashSid(raw);
+  const now = Math.floor(Date.now() / 1000);
+
+  const session: Session = { ...data, sid, issuedAt: now, absoluteExpiry: now + SESSION_TTL };
+
+  await redis.setex(`sess:${sid}`, IDLE_TTL, JSON.stringify(session));
+  await redis.sadd(`usess:${data.userId}`, sid);          // for global revoke
+  await redis.expire(`usess:${data.userId}`, SESSION_TTL);
+
+  (await cookies()).set(SESSION_COOKIE, raw, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_TTL,
+  });
+  return sid;
+}
+
+export async function getSession(): Promise<Session | null> {
+  const raw = (await cookies()).get(SESSION_COOKIE)?.value;
+  if (!raw) return null;
+
+  const sid = hashSid(raw);
+  const json = await redis.get(`sess:${sid}`);
+  if (!json) return null;
+
+  const session = JSON.parse(json) as Session;
+
+  // Constant-time sid compare guards against cache-probing oracles
+  const a = Buffer.from(session.sid);
+  const b = Buffer.from(sid);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+
+  if (Math.floor(Date.now() / 1000) > session.absoluteExpiry) {
+    await destroySession(sid, session.userId);
+    return null;
+  }
+
+  await redis.expire(`sess:${sid}`, IDLE_TTL);            // sliding idle window
+  return session;
+}
+
+export async function destroySession(sid: string, userId: string) {
+  await redis.del(`sess:${sid}`);
+  await redis.srem(`usess:${userId}`, sid);
+  (await cookies()).delete(SESSION_COOKIE);
+}
+
+/** Role revoked, password changed, account disabled → kill everything. */
+export async function revokeAllUserSessions(userId: string) {
+  const sids = await redis.smembers(`usess:${userId}`);
+  if (sids.length) await redis.del(...sids.map((s) => `sess:${s}`));
+  await redis.del(`usess:${userId}`);
+}
+```
+
+```typescript
+// packages/auth/src/authenticate.ts
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import argon2 from 'argon2';
+import { withAnon, withActor, schema } from '@intune/db';
+import { eq, and, or, isNull, gt, sql } from 'drizzle-orm';
+import { createSession } from './session.js';
+import { redis } from './redis.js';
+
+const ARGON_OPTS = {
+  type: argon2.argon2id,
+  memoryCost: 65536,
+  timeCost: 3,
+  parallelism: 4,
+} as const;
+
+export const hashPassword = (pw: string) => argon2.hash(pw, ARGON_OPTS);
+
+/** Loads perms + roles + visible clients in one round trip. */
+async function loadPrincipal(userId: string, tenantId: string) {
+  return withActor({ actorId: userId, tenantId }, async (tx) => {
+    const rows = await tx.execute(sql`
+      SELECT
+        (SELECT coalesce(array_agg(DISTINCT p.perm_code), '{}')
+           FROM core.user_role ur
+           JOIN core.role_permission rp ON rp.role_id = ur.role_id
+           JOIN core.permission p ON p.permission_id = rp.permission_id
+          WHERE ur.user_id = ${userId}
+            AND (ur.expires_at IS NULL OR ur.expires_at > now())) AS permissions,
+        (SELECT coalesce(array_agg(DISTINCT r.role_code), '{}')
+           FROM core.user_role ur
+           JOIN core.role r ON r.role_id = ur.role_id
+          WHERE ur.user_id = ${userId}
+            AND (ur.expires_at IS NULL OR ur.expires_at > now())) AS roles,
+        (SELECT coalesce(array_agg(DISTINCT c.client_id), '{}')
+           FROM crm.contact c
+          WHERE c.portal_user_id = ${userId}
+            AND c.record_status = 'active') AS visible_clients
+    `);
+    const r = rows.rows[0] as any;
+    return {
+      permissions: (r.permissions ?? []) as string[],
+      roles: (r.roles ?? []) as string[],
+      visibleClientIds: (r.visible_clients ?? []) as string[],
+    };
+  });
+}
+
+export async function authenticate(
+  email: string,
+  password: string,
+  ip: string,
+  ua: string,
+): Promise
+  | { ok: true; requiresMfa: boolean; userId: string }
+  | { ok: false; reason: 'invalid' | 'locked' | 'disabled' }
+> {
+  const lockKey = `lock:${email.toLowerCase()}`;
+  const attempts = Number((await redis.get(lockKey)) ?? 0);
+  if (attempts >= 5) return { ok: false, reason: 'locked' };
+
+  const user = await withAnon(async (tx) => {
+    const [u] = await tx.execute(sql`
+      SELECT u.user_id, u.tenant_id, u.is_staff, u.mfa_enrolled,
+             u.record_status, cr.password_hash
+        FROM core.app_user u
+        LEFT JOIN core.user_credential cr ON cr.user_id = u.user_id
+       WHERE lower(u.email) = lower(${email})
+       LIMIT 1
+    `).then((r) => r.rows as any[]);
+    return u;
+  });
+
+  // Dummy verify on miss — equalises timing, prevents user enumeration
+  if (!user) {
+    await argon2.verify(
+      '$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      password,
+    ).catch(() => {});
+    await redis.incr(lockKey);
+    await redis.expire(lockKey, 900);
+    return { ok: false, reason: 'invalid' };
+  }
+
+  if (user.record_status !== 'active') return { ok: false, reason: 'disabled' };
+
+  const valid = await argon2.verify(user.password_hash, password).catch(() => false);
+  if (!valid) {
+    await redis.incr(lockKey);
+    await redis.expire(lockKey, 900);
+    return { ok: false, reason: 'invalid' };
+  }
+
+  await redis.del(lockKey);
+
+  // Staff MFA is mandatory — no bypass path exists
+  if (user.is_staff && !user.mfa_enrolled) {
+    return { ok: true, requiresMfa: true, userId: user.user_id };
+  }
+
+  const principal = await loadPrincipal(user.user_id, user.tenant_id);
+  await createSession({
+    userId: user.user_id,
+    tenantId: user.tenant_id,
+    isStaff: user.is_staff,
+    mfaVerified: !user.mfa_enrolled,
+    ip, ua,
+    ...principal,
+  });
+
+  return { ok: true, requiresMfa: user.mfa_enrolled, userId: user.user_id };
+}
+```
+
+```typescript
+// packages/auth/src/mfa.ts
+import { authenticator } from 'otplib';
+import { randomBytes, createHash } from 'node:crypto';
+import { encryptField, decryptField } from '@intune/crypto';
+import { withActor } from '@intune/db';
+import { sql } from 'drizzle-orm';
+
+authenticator.options = { window: 1, step: 30 };
+
+export async function enrollTotp(userId: string, tenantId: string, email: string) {
+  const secret = authenticator.generateSecret(32);
+  const uri = authenticator.keyuri(email, 'In.Tune ERP', secret);
+
+  const recoveryCodes = Array.from({ length: 10 }, () =>
+    randomBytes(5).toString('hex').toUpperCase().match(/.{1,5}/g)!.join('-'));
+  const hashed = recoveryCodes.map((c) =>
+    createHash('sha256').update(c.replace(/-/g, '')).digest('hex'));
+
+  await withActor({ actorId: userId, tenantId }, async (tx) => {
+    await tx.execute(sql`
+      INSERT INTO core.user_mfa (user_id, method, secret_enc, recovery_hashes, enrolled_at)
+      VALUES (${userId}, 'totp', ${await encryptField(secret)}, ${hashed}, NULL)
+      ON CONFLICT (user_id, method) DO UPDATE
+        SET secret_enc = EXCLUDED.secret_enc,
+            recovery_hashes = EXCLUDED.recovery_hashes,
+            enrolled_at = NULL
+    `);
+  });
+
+  return { uri, recoveryCodes }; // shown exactly once
+}
+
+export async function verifyTotp(userId: string, tenantId: string, token: string) {
+  return withActor({ actorId: userId, tenantId }, async (tx) => {
+    const [row] = await tx.execute(sql`
+      SELECT secret_enc, recovery_hashes, last_used_counter
+        FROM core.user_mfa WHERE user_id = ${userId} AND method = 'totp'
+    `).then((r) => r.rows as any[]);
+    if (!row) return false;
+
+    const secret = await decryptField(row.secret_enc);
+
+    if (authenticator.verify({ token, secret })) {
+      const counter = Math.floor(Date.now() / 1000 / 30);
+      // Replay guard — a given TOTP window is usable once
+      if (row.last_used_counter && Number(row.last_used_counter) >= counter) return false;
+      await tx.execute(sql`
+        UPDATE core.user_mfa SET last_used_counter = ${counter}, enrolled_at = coalesce(enrolled_at, now())
+         WHERE user_id = ${userId} AND method = 'totp'
+      `);
+      await tx.execute(sql`UPDATE core.app_user SET mfa_enrolled = true WHERE user_id = ${userId}`);
+      return true;
+    }
+
+    // Recovery code path — single use, removed on consumption
+    const h = createHash('sha256').update(token.replace(/-/g, '').toUpperCase()).digest('hex');
+    if ((row.recovery_hashes as string[])?.includes(h)) {
+      await tx.execute(sql`
+        UPDATE core.user_mfa SET recovery_hashes = array_remove(recovery_hashes, ${h})
+         WHERE user_id = ${userId} AND method = 'totp'
+      `);
+      return true;
+    }
+    return false;
+  });
+}
+```
+
+**Supporting auth tables** (append to `sql/01_core.sql`):
+
+```sql
+CREATE TABLE core.user_credential (
+  user_id       UUID PRIMARY KEY REFERENCES core.app_user(user_id) ON DELETE CASCADE,
+  password_hash TEXT NOT NULL,
+  must_change   BOOLEAN NOT NULL DEFAULT false,
+  changed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  prev_hashes   TEXT[] DEFAULT '{}',       -- reuse prevention
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE core.user_mfa (
+  user_id     UUID NOT NULL REFERENCES core.app_user(user_id) ON DELETE CASCADE,
+  method      TEXT NOT NULL CHECK (method IN ('totp','webauthn','sms')),
+  secret_enc  BYTEA,
+  credential_json JSONB,
+  recovery_hashes TEXT[],
+  last_used_counter BIGINT,
+  enrolled_at TIMESTAMPTZ,
+  PRIMARY KEY (user_id, method)
+);
+
+CREATE TABLE core.auth_event (
+  event_id   BIGSERIAL PRIMARY KEY,
+  user_id    UUID,
+  email_attempted CITEXT,
+  event_type TEXT NOT NULL CHECK (event_type IN
+             ('login_success','login_failure','mfa_success','mfa_failure',
+              'logout','lockout','password_change','session_revoked','sod_violation')),
+  ip_address INET,
+  user_agent TEXT,
+  detail     JSONB,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_authevent_user ON core.auth_event (user_id, occurred_at DESC);
+```
+
+---
+
+## SECTION 5: AUTHORIZATION — CASL + SoD
+
+RLS is the hard boundary. CASL is the *UX* layer — it decides what buttons render and fails requests early with useful errors.
+
+```typescript
+// packages/policy/src/ability.ts
+import { AbilityBuilder, createMongoAbility, type MongoAbility } from '@casl/ability';
+import type { Session } from '@intune/auth';
+
+type Actions = 'read' | 'create' | 'update' | 'delete' | 'approve' | 'issue' | 'revoke' | 'file';
+type Subjects =
+  | 'Client' | 'KycCase' | 'SarCase' | 'ScreeningHit' | 'Engagement' | 'Project'
+  | 'Case' | 'CaseNote' | 'Workpaper' | 'Assessment' | 'Finding' | 'Certificate'
+  | 'Document' | 'Policy' | 'User' | 'all';
+
+export type AppAbility = MongoAbility<[Actions, Subjects]>;
+
+export function defineAbility(s: Session): AppAbility {
+  const { can, cannot, build } = new AbilityBuilder<AppAbility>(createMongoAbility);
+  const has = (p: string) => s.permissions.includes(p);
+
+  if (s.isStaff) {
+    can('read', ['Client', 'Engagement', 'Project', 'Document']);
+
+    if (has('intake.kyc.read')) can('read', 'KycCase');
+    if (has('intake.kyc.write')) can(['create', 'update'], 'KycCase');
+    if (has('intake.kyc.approve')) can('approve', 'KycCase');
+    if (has('intake.sar.read')) can('read', 'SarCase');
+    if (has('intake.sar.file')) can('file', 'SarCase');
+    if (has('intake.screening.disposition')) can('update', 'ScreeningHit');
+
+    if (has('frame.workpaper.prepare'))
+      can(['create', 'update'], 'Workpaper', { preparedBy: s.userId, isLocked: false });
+    // Four-eyes at the object level: cannot review your own work
+    if (has('frame.workpaper.review'))
+      can('approve', 'Workpaper', { preparedBy: { $ne: s.userId } });
+
+    if (has('frame.assessment.issue')) can('issue', 'Assessment');
+    if (has('frame.certificate.issue')) can('issue', 'Certificate');
+    if (has('frame.certificate.revoke')) can('revoke', 'Certificate');
+    if (has('gov.policy.approve')) can('approve', 'Policy');
+    if (has('core.user.admin')) can(['create', 'update'], 'User');
+
+    if (!has('engage.case.confidential')) cannot('read', 'Case', { isConfidential: true });
+    if (!has('engage.note.privileged')) cannot('read', 'CaseNote', { isPrivileged: true });
+
+    cannot('delete', 'all');   // soft-delete only, everywhere
+  } else {
+    const ids = s.visibleClientIds;
+    can('read', 'Client', { clientId: { $in: ids } });
+    can('read', 'Document', {
+      clientId: { $in: ids },
+      classification: { $in: ['public', 'confidential'] },
+    });
+    can('read', 'Engagement', { clientId: { $in: ids } });
+    cannot('read', ['KycCase', 'SarCase', 'Workpaper', 'CaseNote', 'Policy']);
+  }
+
+  return build();
+}
+```
+
+```typescript
+// packages/policy/src/sod.ts
+import { withActor } from '@intune/db';
+import { sql } from 'drizzle-orm';
+
+export interface SodViolation {
+  roleA: string; roleB: string; severity: string; rationale: string;
+}
+
+/** Called before every role grant. A violation blocks the grant — no override flag. */
+export async function checkSodOnGrant(
+  ctx: { actorId: string; tenantId: string },
+  targetUserId: string,
+  newRoleId: string,
+): Promise<SodViolation[]> {
+  return withActor(ctx, async (tx) => {
+    const r = await tx.execute(sql`
+      SELECT ra.role_code AS role_a, rb.role_code AS role_b,
+             sc.severity::text AS severity, sc.rationale
+        FROM core.sod_conflict sc
+        JOIN core.role ra ON ra.role_id = sc.role_a_id
+        JOIN core.role rb ON rb.role_id = sc.role_b_id
+       WHERE (sc.role_a_id = ${newRoleId} AND sc.role_b_id IN (
+                SELECT role_id FROM core.user_role
+                 WHERE user_id = ${targetUserId}
+                   AND (expires_at IS NULL OR expires_at > now())))
+          OR (sc.role_b_id = ${newRoleId} AND sc.role_a_id IN (
+                SELECT role_id FROM core.user_role
+                 WHERE user_id = ${targetUserId}
+                   AND (expires_at IS NULL OR expires_at > now())))
+    `);
+    return r.rows as unknown as SodViolation[];
+  });
+}
+```
+
+---
+
+## SECTION 6: SERVER ACTION LAYER
+
+Every mutation flows through one gate: authenticated → MFA-verified → CASL-checked → RLS-scoped transaction → audited by trigger. There is no second path.
+
+```typescript
+// apps/web/src/lib/safe-action.ts
+import { createSafeActionClient, DEFAULT_SERVER_ERROR_MESSAGE } from 'next-safe-action';
+import { z } from 'zod';
+import { headers } from 'next/headers';
+import { getSession } from '@intune/auth';
+import { defineAbility } from '@intune/policy';
+import { withActor, type Db } from '@intune/db';
+import { logger } from '@intune/observability';
+import { randomUUID } from 'node:crypto';
+
+export class ForbiddenError extends Error {}
+export class ValidationError extends Error {}
+
+export const actionClient = createSafeActionClient({
+  defineMetadataSchema: () =>
+    z.object({
+      name: z.string(),
+      requiresMfa: z.boolean().default(true),
+    }),
+  handleServerError(e, { metadata }) {
+    if (e instanceof ForbiddenError) return e.message;
+    if (e instanceof ValidationError) return e.message;
+    // DB CHECK/trigger violations surface as business rules — the DB IS the rulebook
+    const msg = (e as any)?.message ?? '';
+    if (msg.includes('ICAEF violation') || msg.includes('TrustFabric:')) return msg;
+    if ((e as any)?.code === '23505') return 'A record with that identifier already exists.';
+    if ((e as any)?.code === '23514') return 'That change violates a business rule.';
+    if ((e as any)?.code === '42501') return 'You do not have access to that record.';
+    logger.error({ err: e, action: metadata?.name }, 'unhandled server action error');
+    return DEFAULT_SERVER_ERROR_MESSAGE;
+  },
+});
+
+/** Authenticated + MFA-enforced + ability-bound + transaction-scoped. */
+export const authAction = actionClient.use(async ({ next, metadata }) => {
+  const session = await getSession();
+  if (!session) throw new ForbiddenError('Not authenticated.');
+  if (metadata.requiresMfa && session.isStaff && !session.mfaVerified) {
+    throw new ForbiddenError('MFA verification required.');
+  }
+
+  const h = await headers();
+  const requestId = h.get('x-request-id') ?? randomUUID();
+  const ability = defineAbility(session);
+
+  const ctx = {
+    actorId: session.userId,
+    tenantId: session.tenantId,
+    requestId,
+    clientIp: h.get('x-forwarded-for')?.split(',')[0]?.trim(),
+  };
+
+  return next({
+    ctx: {
+      session,
+      ability,
+      requestId,
+      /** All DB work goes through here. Never import a raw pool in a route. */
+      db: <T>(fn: (tx: Db) => Promise<T>) => withActor(ctx, fn),
+    },
+  });
+});
+
+export const staffAction = authAction.use(async ({ next, ctx }) => {
+  if (!ctx.session.isStaff) throw new ForbiddenError('Staff access required.');
+  return next({ ctx });
+});
+```
+
+```typescript
+// apps/web/src/server/actions/workpaper.ts
+'use server';
+
+import { z } from 'zod';
+import { revalidatePath } from 'next/cache';
+import { sql } from 'drizzle-orm';
+import { staffAction, ForbiddenError } from '@/lib/safe-action';
+import { subject } from '@casl/ability';
+
+const concludeSchema = z.object({
+  workpaperId: z.string().uuid(),
+  result: z.enum(['effective', 'partially_effective', 'deficient', 'critical_exposure']),
+  conclusion: z.string().min(20, 'A conclusion must be substantive.'),
+  exceptionsNoted: z.number().int().min(0).default(0),
+});
+
+/**
+ * ICAEF™: Evidence Before Conclusion.
+ * We pre-check for a useful error, but the DB trigger is the actual enforcement —
+ * it cannot be bypassed by any caller, including a compromised app server.
+ */
+export const concludeWorkpaper = staffAction
+  .metadata({ name: 'workpaper.conclude' })
+  .schema(concludeSchema)
+  .action(async ({ parsedInput: input, ctx }) => {
+    return ctx.db(async (tx) => {
+      const [wp] = await tx.execute(sql`
+        SELECT wp.workpaper_id, wp.wp_reference, wp.prepared_by, wp.is_locked,
+               tp.min_evidence_tier::text AS min_tier,
+               (SELECT count(*) FROM frame.evidence e
+                 WHERE e.workpaper_id = wp.workpaper_id AND e.is_sufficient IS TRUE)
+                 AS sufficient_evidence
+          FROM frame.workpaper wp
+          JOIN frame.test_procedure tp ON tp.procedure_id = wp.procedure_id
+         WHERE wp.workpaper_id = ${input.workpaperId}
+      `).then((r) => r.rows as any[]);
+
+      if (!wp) throw new ForbiddenError('Workpaper not found or not visible.');
+      if (wp.is_locked) throw new ForbiddenError('Workpaper is locked; reopen it first.');
+
+      if (!ctx.ability.can('update', subject('Workpaper', {
+        preparedBy: wp.prepared_by, isLocked: wp.is_locked,
+      }))) {
+        throw new ForbiddenError('You may not modify this workpaper.');
+      }
+
+      if (Number(wp.sufficient_evidence) === 0) {
+        throw new ForbiddenError(
+          `Cannot conclude ${wp.wp_reference}: no sufficient evidence attached. ` +
+          `ICAEF requires at least one ${wp.min_tier} or stronger item marked sufficient.`,
+        );
+      }
+
+      await tx.execute(sql`
+        UPDATE frame.workpaper
+           SET result = ${input.result}::frame.exam_rating,
+               conclusion = ${input.conclusion},
+               exceptions_noted = ${input.exceptionsNoted},
+               prepared_at = coalesce(prepared_at, now())
+         WHERE workpaper_id = ${input.workpaperId}
+      `);
+
+      revalidatePath(`/assessments/[id]/workpapers`, 'page');
+      return { ok: true as const, reference: wp.wp_reference };
+    });
+  });
+
+const reviewSchema = z.object({
+  workpaperId: z.string().uuid(),
+  approve: z.boolean(),
+  reviewNotes: z.string().optional(),
+});
+
+/** Four-eyes: DB CHECK enforces reviewed_by <> prepared_by. Belt and suspenders. */
+export const reviewWorkpaper = staffAction
+  .metadata({ name: 'workpaper.review' })
+  .schema(reviewSchema)
+  .action(async ({ parsedInput: input, ctx }) => {
+    return ctx.db(async (tx) => {
+      const [wp] = await tx.execute(sql`
+        SELECT prepared_by, result, wp_reference FROM frame.workpaper
+         WHERE workpaper_id = ${input.workpaperId}
+      `).then((r) => r.rows as any[]);
+
+      if (!wp) throw new ForbiddenError('Workpaper not found.');
+      if (!wp.result) throw new ForbiddenError('Cannot review a workpaper with no conclusion.');
+
+      if (!ctx.ability.can('approve', subject('Workpaper', { preparedBy: wp.prepared_by }))) {
+        throw new ForbiddenError(
+          'Independence violation: you prepared this workpaper and cannot review it.',
+        );
+      }
+
+      await tx.execute(sql`
+        UPDATE frame.workpaper
+           SET reviewed_by = ${ctx.session.userId},
+               reviewed_at = now(),
+               is_locked = ${input.approve}
+         WHERE workpaper_id = ${input.workpaperId}
+      `);
+
+      revalidatePath('/assessments');
+      return { ok: true as const };
+    });
+  });
+```
+
+```typescript
+// apps/web/src/server/actions/kyc.ts
+'use server';
+
+import { z } from 'zod';
+import { sql } from 'drizzle-orm';
+import { staffAction, ForbiddenError } from '@/lib/safe-action';
+import { enqueue } from '@intune/jobs';
+
+const approveSchema = z.object({
+  kycCaseId: z.string().uuid(),
+  decision: z.enum(['approved', 'rejected']),
+  rationale: z.string().min(30, 'A decision rationale is required for the audit trail.'),
+});
+
+export const decideKycCase = staffAction
+  .metadata({ name: 'kyc.decide' })
+  .schema(approveSchema)
+  .action(async ({ parsedInput: input, ctx }) => {
+    if (!ctx.ability.can('approve', 'KycCase')) {
+      throw new ForbiddenError('You lack KYC approval authority.');
+    }
+
+    return ctx.db(async (tx) => {
+      const [kc] = await tx.execute(sql`
+        SELECT kyc_case_id, client_id, reviewed_by, risk_rating::text AS risk, status::text
+          FROM intake.kyc_case WHERE kyc_case_id = ${input.kycCaseId}
+      `).then((r) => r.rows as any[]);
+
+      if (!kc) throw new ForbiddenError('Case not found.');
+      if (kc.reviewed_by === ctx.session.userId) {
+        throw new ForbiddenError(
+          'Four-eyes violation: you reviewed this case and cannot also approve it.',
+        );
+      }
+
+      // Unresolved sanctions hits block approval outright
+      const [{ pending }] = await tx.execute(sql`
+        SELECT count(*)::int AS pending
+          FROM intake.screening_hit h
+          JOIN intake.screening_run r ON r.screening_id = h.screening_id
+         WHERE r.kyc_case_id = ${input.kycCaseId} AND h.disposition = 'pending'
+      `).then((r) => r.rows as any[]);
+
+      if (pending > 0 && input.decision === 'approved') {
+        throw new ForbiddenError(
+          `${pending} screening hit(s) remain undispositioned. Resolve before approval.`,
+        );
+      }
+
+      const cadence: Record<string, number> = {
+        critical: 90, high: 180, elevated: 365, moderate: 730, low: 1095,
+      };
+
+      await tx.execute(sql`
+        UPDATE intake.kyc_case
+           SET status = ${input.decision}::intake.kyc_status,
+               approved_by = ${ctx.session.userId},
+               decided_at = now(),
+               decision_rationale = ${input.rationale},
+               next_review_due = CASE WHEN ${input.decision} = 'approved'
+                 THEN CURRENT_DATE + ${cadence[kc.risk ?? 'moderate'] ?? 730}
+                 ELSE NULL END
+         WHERE kyc_case_id = ${input.kycCaseId}
+      `);
+
+      if (input.decision === 'approved') {
+        await tx.execute(sql`
+          UPDATE crm.client SET record_status = 'active', onboarded_at = coalesce(onboarded_at, now())
+           WHERE client_id = ${kc.client_id}
+        `);
+      }
+
+      await enqueue('notification.send', {
+        tenantId: ctx.session.tenantId,
+        template: 'kyc_decision',
+        payload: { kycCaseId: input.kycCaseId, decision: input.decision },
+      });
+
+      return { ok: true as const };
+    });
+  });
+```
+
+---
+
+## SECTION 7: REST API (Hono)
+
+For n8n, external integrations, and anything that isn't the browser.
+
+```typescript
+// apps/web/src/app/api/v1/[[...route]]/route.ts
+import { Hono } from 'hono';
+import { handle } from 'hono/vercel';
+import { cors } from 'hono/cors';
+import { logger as honoLogger } from 'hono/logger';
+import { zValidator } from '@hono/zod-validator';
+import { z } from 'zod';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { withActor, withAnon } from '@intune/db';
+import { sql } from 'drizzle-orm';
+
+export const runtime = 'nodejs';
+
+type Env = { Variables: { actorId: string; tenantId: string; scopes: string[] } };
+
+const app = new Hono<Env>().basePath('/api/v1');
+
+app.use('*', honoLogger());
+app.use('*', cors({ origin: (o) => (o?.endsWith('.trustintune.com') ? o : ''), credentials: true }));
+
+// ── API key auth: sha256(key) stored, never the key itself
+app.use('*', async (c, next) => {
+  if (c.req.path.endsWith('/health')) return next();
+
+  const raw = c.req.header('x-api-key');
+  if (!raw) return c.json({ error: 'missing_api_key' }, 401);
+
+  const hash = createHash('sha256').update(raw).digest('hex');
+  const key = await withAnon(async (tx) => {
+    const [k] = await tx.execute(sql`
+      SELECT api_key_id, user_id, tenant_id, scopes, expires_at, revoked_at
+        FROM core.api_key WHERE key_hash = ${hash} LIMIT 1
+    `).then((r) => r.rows as any[]);
+    return k;
+  });
+
+  if (!key || key.revoked_at || (key.expires_at && new Date(key.expires_at) < new Date())) {
+    return c.json({ error: 'invalid_api_key' }, 401);
+  }
+
+  c.set('actorId', key.user_id);
+  c.set('tenantId', key.tenant_id);
+  c.set('scopes', key.scopes ?? []);
+
+  // Fire-and-forget last-use stamp
+  withAnon((tx) => tx.execute(sql`
+    UPDATE core.api_key SET last_used_at = now(), use_count = use_count + 1
+     WHERE api_key_id = ${key.api_key_id}`)).catch(() => {});
+
+  await next();
+});
+
+const requireScope = (scope: string) => async (c: any, next: any) => {
+  const scopes: string[] = c.get('scopes');
+  if (!scopes.includes(scope) && !scopes.includes('*')) {
+    return c.json({ error: 'insufficient_scope', required: scope }, 403);
+  }
+  await next();
+};
+
+app.get('/health', async (c) => {
+  const { healthcheck } = await import('@intune/db');
+  return c.json({ status: (await healthcheck()) ? 'ok' : 'degraded', ts: new Date().toISOString() });
+});
+
+// ── Screening result callback (n8n posts OFAC/WorldCheck results back)
+const screeningResult = z.object({
+  screeningId: z.string().uuid(),
+  provider: z.string(),
+  hits: z.array(z.object({
+    matchedName: z.string(),
+    matchScore: z.number().min(0).max(100),
+    listSource: z.string(),
+    details: z.record(z.unknown()),
+  })),
+  responsePayload: z.record(z.unknown()),
+});
+
+app.post('/screening/result',
+  requireScope('screening:write'),
+  zValidator('json', screeningResult),
+  async (c) => {
+    const b = c.req.valid('json');
+    const ctx = { actorId: c.get('actorId'), tenantId: c.get('tenantId') };
+
+    await withActor(ctx, async (tx) => {
+      await tx.execute(sql`
+        UPDATE intake.screening_run
+           SET response_payload = ${JSON.stringify(b.responsePayload)}::jsonb,
+               hit_count = ${b.hits.length}
+         WHERE screening_id = ${b.screeningId}
+      `);
+
+      for (const h of b.hits) {
+        await tx.execute(sql`
+          INSERT INTO intake.screening_hit
+            (screening_id, matched_name, match_score, list_source, match_details)
+          VALUES (${b.screeningId}, ${h.matchedName}, ${h.matchScore},
+                  ${h.listSource}, ${JSON.stringify(h.details)}::jsonb)
+        `);
+      }
+
+      // Auto-escalate high-confidence sanctions matches
+      if (b.hits.some((h) => h.matchScore >= 95)) {
+        await tx.execute(sql`
+          INSERT INTO core.notification (tenant_id, channel, subject, body, payload)
+          SELECT ${ctx.tenantId}, 'email', 'URGENT: high-confidence sanctions match',
+                 'Screening ' || ${b.screeningId} || ' returned a >=95% match.',
+                 jsonb_build_object('screening_id', ${b.screeningId})
+        `);
+      }
+    });
+
+    return c.json({ ok: true, hitsRecorded: b.hits.length });
+  });
+
+// ── Attestation submission — TrustFabric "No Proof, No Payment"
+const attestation = z.object({
+  clientId: z.string().uuid(),
+  grantId: z.string().uuid(),
+  certificateId: z.string().uuid(),
+  transactionRef: z.string().min(1),
+  transactionType: z.string(),
+  amount: z.number().positive(),
+  currencyCode: z.string().length(3).default('USD'),
+  counterparty: z.string().optional(),
+  payloadHash: z.string().regex(/^[a-f0-9]{64}$/, 'must be a sha256 hex digest'),
+  signatureB64: z.string(),
+  deviceAttestation: z.record(z.unknown()).optional(),
+});
+
+app.post('/trustfabric/attest',
+  requireScope('trustfabric:write'),
+  zValidator('json', attestation),
+  async (c) => {
+    const b = c.req.valid('json');
+    const ctx = { actorId: c.get('actorId'), tenantId: c.get('tenantId') };
+
+    try {
+      const id = await withActor(ctx, async (tx) => {
+        // The trg_no_proof_no_payment trigger validates grant + cert + limit.
+        // If it raises, we never reach the return.
+        const [row] = await tx.execute(sql`
+          INSERT INTO frame.transaction_attestation
+            (client_id, grant_id, certificate_id, transaction_ref, transaction_type,
+             amount, currency_code, counterparty, payload_hash, signature_b64, device_attestation)
+          VALUES (${b.clientId}, ${b.grantId}, ${b.certificateId}, ${b.transactionRef},
+                  ${b.transactionType}, ${b.amount}, ${b.currencyCode}, ${b.counterparty ?? null},
+                  ${b.payloadHash}, ${b.signatureB64},
+                  ${b.deviceAttestation ? JSON.stringify(b.deviceAttestation) : null}::jsonb)
+          RETURNING attestation_id
+        `).then((r) => r.rows as any[]);
+        return row.attestation_id as string;
+      });
+
+      return c.json({ ok: true, attestationId: id, status: 'pending_verification' }, 201);
+    } catch (e: any) {
+      if (String(e?.message).includes('TrustFabric:')) {
+        return c.json({ error: 'attestation_rejected', reason: e.message }, 422);
+      }
+      throw e;
+    }
+  });
+
+app.get('/compliance/calendar',
+  requireScope('reports:read'),
+  zValidator('query', z.object({
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+    urgency: z.enum(['high', 'normal']).optional(),
+  })),
+  async (c) => {
+    const q = c.req.valid('query');
+    const ctx = { actorId: c.get('actorId'), tenantId: c.get('tenantId') };
+    const rows = await withActor(ctx, async (tx) =>
+      (await tx.execute(sql`
+        SELECT * FROM rpt.mv_compliance_calendar
+         WHERE due_date BETWEEN ${q.from ?? 'CURRENT_DATE'}::date
+                            AND ${q.to ?? '(CURRENT_DATE + 90)'}::date
+           AND (${q.urgency ?? null}::text IS NULL OR urgency = ${q.urgency ?? null})
+         ORDER BY due_date ASC
+      `)).rows);
+    return c.json({ items: rows, count: rows.length });
+  });
+
+export const GET = handle(app);
+export const POST = handle(app);
+export const PATCH = handle(app);
+export const DELETE = handle(app);
+```
+
+```sql
+-- API keys (append to sql/01_core.sql)
+CREATE TABLE core.api_key (
+  api_key_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  user_id     UUID NOT NULL REFERENCES core.app_user(user_id),
+  key_name    TEXT NOT NULL,
+  key_hash    TEXT NOT NULL UNIQUE,      -- sha256(plaintext); plaintext never stored
+  key_prefix  TEXT NOT NULL,             -- 'itk_live_a1b2' for UI display
+  scopes      TEXT[] NOT NULL DEFAULT '{}',
+  last_used_at TIMESTAMPTZ,
+  use_count   BIGINT NOT NULL DEFAULT 0,
+  expires_at  TIMESTAMPTZ,
+  revoked_at  TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_apikey_active ON core.api_key (key_hash) WHERE revoked_at IS NULL;
+```
+
+---
+
+## SECTION 8: CRYPTO
+
+```typescript
+// packages/crypto/src/field.ts
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto';
+
+/**
+ * Envelope encryption for PII at rest (EIN, SSN, account numbers).
+ * Stored as: [1B version][12B IV][16B tag][ciphertext] → BYTEA.
+ * DEK held in env/KMS; the DB never sees the key material.
+ */
+const VERSION = 0x01;
+
+function dek(): Buffer {
+  const k = process.env.FIELD_ENCRYPTION_KEY;
+  if (!k) throw new Error('FIELD_ENCRYPTION_KEY not set');
+  const buf = Buffer.from(k, 'base64');
+  if (buf.length !== 32) throw new Error('FIELD_ENCRYPTION_KEY must be 32 bytes base64');
+  return buf;
+}
+
+export async function encryptField(plaintext: string, aad?: string): Promise<Buffer> {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', dek(), iv);
+  if (aad) cipher.setAAD(Buffer.from(aad, 'utf8'));
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return Buffer.concat([Buffer.from([VERSION]), iv, cipher.getAuthTag(), ct]);
+}
+
+export async function decryptField(blob: Buffer, aad?: string): Promise<string> {
+  if (blob[0] !== VERSION) throw new Error(`unsupported field cipher version ${blob[0]}`);
+  const iv = blob.subarray(1, 13);
+  const tag = blob.subarray(13, 29);
+  const ct = blob.subarray(29);
+  const d = createDecipheriv('aes-256-gcm', dek(), iv);
+  d.setAuthTag(tag);
+  if (aad) d.setAAD(Buffer.from(aad, 'utf8'));
+  return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
+}
+
+/** Deterministic blind index — enables equality search on encrypted columns. */
+export function blindIndex(value: string): string {
+  const pepper = process.env.BLIND_INDEX_PEPPER;
+  if (!pepper) throw new Error('BLIND_INDEX_PEPPER not set');
+  return createHash('sha256')
+    .update(pepper).update('\x00').update(value.trim().toLowerCase())
+    .digest('hex');
+}
+
+export const sha256 = (b: Buffer | string) =>
+  createHash('sha256').update(b).digest('hex');
+```
+
+---
+
+## SECTION 9: STORAGE
+
+```typescript
+// packages/storage/src/documents.ts
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { randomUUID } from 'node:crypto';
+
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT,
+  region: process.env.S3_REGION ?? 'us-east-1',
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY!,
+    secretAccessKey: process.env.S3_SECRET_KEY!,
+  },
+});
+
+const BUCKET = process.env.S3_BUCKET ?? 'intune-documents';
+
+/** Key layout keeps tenant isolation visible at the object-store level. */
+export function buildKey(p: {
+  tenantId: string; clientId?: string; documentId: string; version: number; filename: string;
+}) {
+  const safe = p.filename.replace(/[^\w.\-]/g, '_').slice(0, 120);
+  const scope = p.clientId ? `clients/${p.clientId}` : 'internal';
+  return `${p.tenantId}/${scope}/${p.documentId}/v${p.version}/${safe}`;
+}
+
+/** Direct-to-storage upload. Bytes never transit the Next.js process. */
+export async function presignUpload(key: string, contentType: string, maxBytes = 200 * 1024 ** 2) {
+  return getSignedUrl(s3, new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: key,
+    ContentType: contentType,
+    ServerSideEncryption: 'AES256',
+    Metadata: { uploadid: randomUUID() },
+  }), { expiresIn: 900, signableHeaders: new Set(['content-type', 'content-length']) });
+}
+
+/** Short TTL — every download is logged server-side before the URL is minted. */
+export async function presignDownload(key: string, filename: string, ttl = 300) {
+  return getSignedUrl(s3, new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: key,
+    ResponseContentDisposition: `attachment; filename="${encodeURIComponent(filename)}"`,
+  }), { expiresIn: ttl });
+}
+
+export async function objectMeta(key: string) {
+  const r = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+  return { size: r.ContentLength, etag: r.ETag, contentType: r.ContentType };
+}
+```
+
+```typescript
+// apps/web/src/server/actions/documents.ts
+'use server';
+
+import { z } from 'zod';
+import { sql } from 'drizzle-orm';
+import { staffAction, ForbiddenError } from '@/lib/safe-action';
+import { buildKey, presignUpload, presignDownload } from '@intune/storage';
+import { enqueue } from '@intune/jobs';
+
+export const requestUpload = staffAction
+  .metadata({ name: 'document.requestUpload' })
+  .schema(z.object({
+    documentId: z.string().uuid().optional(),
+    clientId: z.string().uuid().optional(),
+    engagementId: z.string().uuid().optional(),
+    title: z.string().min(1),
+    docType: z.enum(['policy','procedure','contract','engagement_letter','report','workpaper',
+                     'evidence','identification','financial_statement','bank_statement',
+                     'certificate','correspondence','deliverable','other']),
+    classification: z.enum(['public','internal','confidential','restricted','privileged'])
+      .default('confidential'),
+    filename: z.string().min(1),
+    contentType: z.string(),
+    byteSize: z.number().int().positive().max(200 * 1024 ** 2),
+  }))
+  .action(async ({ parsedInput: i, ctx }) => {
+    return ctx.db(async (tx) => {
+      let documentId = i.documentId;
+      let version = 1;
+
+      if (documentId) {
+        const [d] = await tx.execute(sql`
+          SELECT current_version, legal_hold FROM docs.document WHERE document_id = ${documentId}
+        `).then((r) => r.rows as any[]);
+        if (!d) throw new ForbiddenError('Document not found.');
+        version = Number(d.current_version) + 1;
+      } else {
+        const [row] = await tx.execute(sql`
+          INSERT INTO docs.document
+            (tenant_id, client_id, engagement_id, doc_number, title, doc_type,
+             classification, owner_id, current_version)
+          VALUES (${ctx.session.tenantId}, ${i.clientId ?? null}, ${i.engagementId ?? null},
+                  'DOC-' || to_char(now(),'YYYY') || '-' ||
+                    lpad(nextval('docs.seq_doc')::text, 6, '0'),
+                  ${i.title}, ${i.docType}, ${i.classification}, ${ctx.session.userId}, 1)
+          RETURNING document_id
+        `).then((r) => r.rows as any[]);
+        documentId = row.document_id;
+      }
+
+      const key = buildKey({
+        tenantId: ctx.session.tenantId,
+        clientId: i.clientId,
+        documentId: documentId!,
+        version,
+        filename: i.filename,
+      });
+
+      await tx.execute(sql`
+        INSERT INTO docs.document_version
+          (document_id, version_no, storage_bucket, storage_key, filename,
+           mime_type, byte_size, sha256_hash, uploaded_by, virus_scan_status)
+        VALUES (${documentId}, ${version}, ${process.env.S3_BUCKET}, ${key}, ${i.filename},
+                ${i.contentType}, ${i.byteSize}, 'pending', ${ctx.session.userId}, 'pending')
+      `);
+
+      const uploadUrl = await presignUpload(key, i.contentType, i.byteSize);
+      return { documentId, version, key, uploadUrl };
+    });
+  });
+
+/** Called by the client after the PUT completes. Triggers AV + hash + indexing. */
+export const finalizeUpload = staffAction
+  .metadata({ name: 'document.finalize' })
+  .schema(z.object({ documentId: z.string().uuid(), version: z.number().int() }))
+  .action(async ({ parsedInput: i, ctx }) => {
+    await ctx.db(async (tx) => {
+      await tx.execute(sql`
+        UPDATE docs.document SET current_version = ${i.version}
+         WHERE document_id = ${i.documentId} AND current_version < ${i.version}
+      `);
+    });
+    await enqueue('document.scan', { documentId: i.documentId, version: i.version });
+    return { ok: true as const };
+  });
+
+/** Download is a *logged event*, not a link. Log first, then mint. */
+export const getDownloadUrl = staffAction
+  .metadata({ name: 'document.download' })
+  .schema(z.object({ documentId: z.string().uuid(), versionNo: z.number().int().optional() }))
+  .action(async ({ parsedInput: i, ctx }) => {
+    return ctx.db(async (tx) => {
+      const [v] = await tx.execute(sql`
+        SELECT dv.version_id, dv.storage_key, dv.filename, dv.virus_scan_status,
+               d.legal_hold, d.classification
+          FROM docs.document_version dv
+          JOIN docs.document d ON d.document_id = dv.document_id
+         WHERE dv.document_id = ${i.documentId}
+           AND dv.version_no = coalesce(${i.versionNo ?? null}, d.current_version)
+      `).then((r) => r.rows as any[]);
+
+      if (!v) throw new ForbiddenError('Document version not found or not visible.');
+      if (v.virus_scan_status === 'infected') throw new ForbiddenError('File failed malware scan.');
+      if (v.virus_scan_status === 'pending') throw new ForbiddenError('File is still being scanned.');
+
+      await tx.execute(sql`
+        INSERT INTO docs.document_access_log (document_id, version_id, user_id, action, ip_address)
+        VALUES (${i.documentId}, ${v.version_id}, ${ctx.session.userId}, 'download',
+                ${ctx.session.ip}::inet)
+      `);
+
+      return { url: await presignDownload(v.storage_key, v.filename), filename: v.filename };
+    });
+  });
+```
+
+---
+
+## SECTION 10: JOB QUEUE + WORKER
+
+pg_cron handles in-DB scheduling. BullMQ handles anything needing network egress — email, screening APIs, AV, embeddings, PDF rendering.
+
+```typescript
+// packages/jobs/src/queue.ts
+import { Queue, type JobsOptions } from 'bullmq';
+import IORedis from 'ioredis';
+
+export const connection = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+
+export interface JobMap {
+  'notification.send': { tenantId: string; notificationId?: string; template: string; payload: Record<string, unknown> };
+  'document.scan': { documentId: string; version: number };
+  'document.embed': { documentId: string; version: number };
+  'screening.run': { screeningId: string; provider: string; searchTerm: string; listType: string };
+  'report.render': { assessmentId: string; format: 'pdf' | 'docx'; requestedBy: string };
+  'certificate.sync': { certificateId?: string };
+  'kb.reindex': { articleId: string };
+}
+
+export const queues = {
+  default: new Queue('default', { connection }),
+  documents: new Queue('documents', { connection }),
+  screening: new Queue('screening', { connection }),
+  reports: new Queue('reports', { connection }),
+} as const;
+
+const routing: Record<keyof JobMap, keyof typeof queues> = {
+  'notification.send': 'default',
+  'document.scan': 'documents',
+  'document.embed': 'documents',
+  'screening.run': 'screening',
+  'report.render': 'reports',
+  'certificate.sync': 'default',
+  'kb.reindex': 'documents',
+};
+
+export async function enqueue<K extends keyof JobMap>(
+  name: K, data: JobMap[K], opts?: JobsOptions,
+) {
+  return queues[routing[name]].add(name, data, {
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 5_000 },
+    removeOnComplete: { age: 86_400, count: 1_000 },
+    removeOnFail: { age: 604_800 },
+    ...opts,
+  });
+}
+```
+
+```typescript
+// apps/worker/src/index.ts
+import { Worker } from 'bullmq';
+import { connection, type JobMap } from '@intune/jobs';
+import { logger } from '@intune/observability';
+import { sendNotification } from './processors/notification.js';
+import { scanDocument, embedDocument } from './processors/documents.js';
+import { runScreening } from './processors/screening.js';
+import { renderReport } from './processors/report.js';
+import { shutdown as dbShutdown } from '@intune/db';
+
+const handlers: { [K in keyof JobMap]: (d: JobMap[K]) => Promise<unknown> } = {
+  'notification.send': sendNotification,
+  'document.scan': scanDocument,
+  'document.embed': embedDocument,
+  'screening.run': runScreening,
+  'report.render': renderReport,
+  'certificate.sync': async () => {},
+  'kb.reindex': async () => {},
+};
+
+const workers = (['default', 'documents', 'screening', 'reports'] as const).map((q) =>
+  new Worker(q, async (job) => {
+    const h = handlers[job.name as keyof JobMap];
+    if (!h) throw new Error(`no handler for ${job.name}`);
+    logger.info({ job: job.name, id: job.id }, 'processing');
+    return h(job.data as any);
+  }, {
+    connection,
+    concurrency: q === 'documents' ? 4 : 8,
+    limiter: q === 'screening' ? { max: 10, duration: 1_000 } : undefined,
+  }));
+
+for (const w of workers) {
+  w.on('failed', (job, err) =>
+    logger.error({ job: job?.name, id: job?.id, attempts: job?.attemptsMade, err }, 'job failed'));
+  w.on('completed', (job) => logger.debug({ job: job.name, id: job.id }, 'job completed'));
+}
+
+// Notification outbox drain: pg_cron writes rows, this pushes them to BullMQ.
+// Decouples DB scheduling from network I/O — the DB never makes an outbound call.
+import { dbAdmin, sql } from '@intune/db';
+import { enqueue } from '@intune/jobs';
+
+setInterval(async () => {
+  try {
+    const rows = await dbAdmin.execute(sql`
+      UPDATE core.notification
+         SET status = 'sent', attempts = attempts + 1
+       WHERE notification_id IN (
+         SELECT notification_id FROM core.notification
+          WHERE status = 'queued' AND send_after <= now() AND attempts < 5
+          ORDER BY send_after
+          FOR UPDATE SKIP LOCKED
+          LIMIT 50)
+      RETURNING notification_id, tenant_id, channel, subject, body, payload, user_id
+    `);
+    for (const n of rows.rows as any[]) {
+      await enqueue('notification.send', {
+        tenantId: n.tenant_id,
+        notificationId: n.notification_id,
+        template: n.channel,
+        payload: { ...n.payload, subject: n.subject, body: n.body, userId: n.user_id },
+      });
+    }
+  } catch (e) {
+    logger.error({ err: e }, 'outbox drain failed');
+  }
+}, 10_000);
+
+async function gracefulShutdown(sig: string) {
+  logger.info({ sig }, 'shutting down worker');
+  await Promise.all(workers.map((w) => w.close()));
+  await dbShutdown();
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+```
+
+```typescript
+// apps/worker/src/processors/documents.ts
+import { createHash } from 'node:crypto';
+import net from 'node:net';
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { dbAdmin, sql } from '@intune/db';
+import { enqueue } from '@intune/jobs';
+import type { JobMap } from '@intune/jobs';
+
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT,
+  region: process.env.S3_REGION ?? 'us-east-1',
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY!,
+    secretAccessKey: process.env.S3_SECRET_KEY!,
+  },
+});
+
+/** ClamAV INSTREAM over TCP — streams without buffering the whole file. */
+function clamScan(stream: NodeJS.ReadableStream): Promise<'clean' | 'infected'> {
+  return new Promise((resolve, reject) => {
+    const sock = net.createConnection({
+      host: process.env.CLAMAV_HOST ?? 'clamav',
+      port: Number(process.env.CLAMAV_PORT ?? 3310),
+    });
+    let out = '';
+    sock.on('connect', () => {
+      sock.write('zINSTREAM\0');
+      stream.on('data', (c: Buffer) => {
+        const len = Buffer.alloc(4);
+        len.writeUInt32BE(c.length);
+        sock.write(len); sock.write(c);
+      });
+      stream.on('end', () => sock.write(Buffer.alloc(4)));
+    });
+    sock.on('data', (d) => { out += d.toString(); });
+    sock.on('end', () => resolve(out.includes('OK') ? 'clean' : 'infected'));
+    sock.on('error', reject);
+  });
+}
+
+export async function scanDocument(d: JobMap['document.scan']) {
+  const [v] = await dbAdmin.execute(sql`
+    SELECT version_id, storage_bucket, storage_key
+      FROM docs.document_version
+     WHERE document_id = ${d.documentId} AND version_no = ${d.version}
+  `).then((r) => r.rows as any[]);
+  if (!v) throw new Error(`version not found: ${d.documentId} v${d.version}`);
+
+  const obj = await s3.send(new GetObjectCommand({ Bucket: v.storage_bucket, Key: v.storage_key }));
+  const body = obj.Body as NodeJS.ReadableStream;
+
+  // Tee the stream: hash and scan in one pass
+  const hash = createHash('sha256');
+  body.on('data', (c: Buffer) => hash.update(c));
+  const verdict = await clamScan(body);
+  const digest = hash.digest('hex');
+
+  await dbAdmin.execute(sql`
+    UPDATE docs.document_version
+       SET virus_scan_status = ${verdict}, virus_scanned_at = now(), sha256_hash = ${digest}
+     WHERE version_id = ${v.version_id}
+  `);
+
+  if (verdict === 'infected') {
+    await dbAdmin.execute(sql`
+      INSERT INTO core.notification (tenant_id, channel, subject, body, payload)
+      SELECT d.tenant_id, 'email', 'SECURITY: infected upload quarantined',
+             'Document ' || d.doc_number || ' failed malware scanning and is blocked.',
+             jsonb_build_object('document_id', d.document_id)
+        FROM docs.document d WHERE d.document_id = ${d.documentId}
+    `);
+    return { verdict, quarantined: true };
+  }
+
+  // Evidence integrity: bind the hash to the evidence record
+  await dbAdmin.execute(sql`
+    UPDATE frame.evidence SET sha256_hash = ${digest}
+     WHERE document_id = ${d.documentId} AND sha256_hash IS NULL
+  `);
+
+  await enqueue('document.embed', { documentId: d.documentId, version: d.version });
+  return { verdict, sha256: digest };
+}
+
+export async function embedDocument(d: JobMap['document.embed']) {
+  // Extract → chunk → embed → kb.chunk. Text extraction by mime type;
+  // pdf-parse / mammoth / plain read, then chunk at ~800 tokens with 100 overlap.
+  // Left as an integration point — the vector column and HNSW index already exist.
+  return { documentId: d.documentId, status: 'queued_for_extraction' };
+}
+```
+
+---
+
+## SECTION 11: MIDDLEWARE + SECURITY HEADERS
+
+```typescript
+// apps/web/src/middleware.ts
+import { NextResponse, type NextRequest } from 'next/server';
+import { randomUUID } from 'node:crypto';
+
+const PUBLIC = ['/login', '/mfa', '/api/v1/health', '/api/webhooks', '/share'];
+
+export function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+  const requestId = req.headers.get('x-request-id') ?? randomUUID();
+  const nonce = Buffer.from(randomUUID()).toString('base64');
+
+  const headers = new Headers(req.headers);
+  headers.set('x-request-id', requestId);
+  headers.set('x-nonce', nonce);
+
+  const isPublic = PUBLIC.some((p) => pathname.startsWith(p));
+  const hasSession = req.cookies.has('__Host-intune_sid');
+
+  if (!isPublic && !hasSession) {
+    const url = req.nextUrl.clone();
+    url.pathname = '/login';
+    url.searchParams.set('next', pathname);
+    return NextResponse.redirect(url);
+  }
+
+  const res = NextResponse.next({ request: { headers } });
+
+  res.headers.set('x-request-id', requestId);
+  res.headers.set(
+    'Content-Security-Policy',
+    [
+      `default-src 'self'`,
+      `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+      `style-src 'self' 'unsafe-inline'`,
+      `img-src 'self' data: blob: https://files.trustintune.com`,
+      `connect-src 'self' https://files.trustintune.com`,
+      `font-src 'self'`,
+      `object-src 'none'`,
+      `base-uri 'none'`,
+      `frame-ancestors 'none'`,
+      `form-action 'self'`,
+      `upgrade-insecure-requests`,
+    ].join('; '),
+  );
+  res.headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  res.headers.set('X-Content-Type-Options', 'nosniff');
+  res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+
+  return res;
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|woff2)$).*)'],
+};
+```
+
+```typescript
+// apps/web/next.config.ts
+import type { NextConfig } from 'next';
+
+const config: NextConfig = {
+  output: 'standalone',
+  reactStrictMode: true,
+  poweredByHeader: false,
+  experimental: {
+    serverActions: { bodySizeLimit: '2mb', allowedOrigins: ['erp.trustintune.com'] },
+    optimizePackageImports: ['lucide-react', 'date-fns'],
+  },
+  serverExternalPackages: ['pg', 'argon2', '@aws-sdk/client-s3'],
+  logging: { fetches: { fullUrl: false } },
+};
+
+export default config;
+```
+
+---
+
+## SECTION 12: REVISED DOCKER COMPOSE
+
+```yaml
+# docker-compose.yml  (NocoBase removed; web + worker added)
+name: intune-erp
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+x-app-env: &app-env
+  NODE_ENV: production
+  DATABASE_URL_APP: postgres://intune_web:${WEB_DB_PASSWORD}@postgres:5432/intune?sslmode=verify-full
+  DATABASE_URL_ADMIN: postgres://intune_admin:${ADMIN_DB_PASSWORD}@postgres:5432/intune?sslmode=verify-full
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: intune-documents
+  S3_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+  S3_SECRET_KEY: ${MINIO_SECRET_KEY}
+  CLAMAV_HOST: clamav
+  FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY}
+  BLIND_INDEX_PEPPER: ${BLIND_INDEX_PEPPER}
+  PG_CA_CERT_FILE: /certs/ca.crt
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: intune-pg
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: intune
+      POSTGRES_USER: intune_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_cron,pg_stat_statements
+      -c cron.database_name=intune
+      -c max_connections=200
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=512MB
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='pgbackrest --stanza=intune archive-push %p'
+      -c log_statement=ddl
+      -c log_min_duration_statement=1000
+      -c log_connections=on
+      -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+      - ./certs:/certs:ro
+    secrets: [pg_password]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U intune_admin -d intune"]
+      interval: 10s
+      retries: 5
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+      --maxmemory 1gb --maxmemory-policy noeviction
+    volumes: [redisdata:/data]
+    networks: [data]
+    logging: *logging
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      MINIO_SERVER_URL: https://files.trustintune.com
+    volumes: [miniodata:/data]
+    networks: [data, app]
+    logging: *logging
+
+  clamav:
+    image: clamav/clamav:latest
+    restart: unless-stopped
+    volumes: [clamdb:/var/lib/clamav]
+    networks: [data]
+    logging: *logging
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    environment:
+      <<: *app-env
+      PORT: 3000
+      NEXT_PUBLIC_APP_URL: https://erp.trustintune.com
+    volumes: [./certs:/certs:ro]
+    networks: [data, app]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/v1/health').then(r=>process.exit(r.ok?0:1))"]
+      interval: 30s
+    deploy:
+      replicas: 2
+    logging: *logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+    environment: *app-env
+    volumes: [./certs:/certs:ro]
+    networks: [data]
+    logging: *logging
+
+  metabase:
+    image: metabase/metabase:latest
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase_app
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_SECRET}
+      JAVA_TIMEZONE: America/Denver
+    networks: [data, app]
+    logging: *logging
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n_app
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: automation.trustintune.com
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://automation.trustintune.com/
+      GENERIC_TIMEZONE: America/Denver
+      N8N_DIAGNOSTICS_ENABLED: "false"
+    volumes: [n8ndata:/home/node/.n8n]
+    networks: [data, app]
+    logging: *logging
+
+  pgbackrest:
+    image: pgbackrest/pgbackrest:latest
+    restart: unless-stopped
+    depends_on: [postgres]
+    volumes:
+      - pgdata:/var/lib/postgresql/data:ro
+      - backups:/var/lib/pgbackrest
+      - ./pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks: [data]
+    logging: *logging
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on: [web, metabase, n8n]
+    networks: [app]
+    logging: *logging
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  clamdb: {}
+  n8ndata: {}
+  backups: {}
+  nginx_cache: {}
+
+networks:
+  data: { internal: true }
+  app: { driver: bridge }
+
+secrets:
+  pg_password:
+    file: ./secrets/pg_password.txt
+```
+
+```dockerfile
+# apps/web/Dockerfile
+FROM node:22-alpine AS base
+RUN apk add --no-cache libc6-compat python3 make g++
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json ./
+COPY apps/web/package.json ./apps/web/
+COPY packages/*/package.json ./packages/
+RUN npm ci --omit=dev --workspaces --include-workspace-root
+
+FROM base AS builder
+COPY package.json package-lock.json ./
+COPY apps/web/package.json ./apps/web/
+COPY packages ./packages
+RUN npm ci
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build --workspace=apps/web
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/static ./apps/web/.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/public ./apps/web/public
+USER nextjs
+EXPOSE 3000
+CMD ["node", "apps/web/server.js"]
+```
+
+```sql
+-- sql/99_roles.sql  — replaces the NocoBase role block
+CREATE ROLE intune_readonly NOLOGIN;
+CREATE ROLE intune_app NOLOGIN;
+
+GRANT USAGE ON SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt TO intune_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt TO intune_readonly;
+
+GRANT USAGE ON SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt TO intune_app;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA
+  core,crm,intake,engage,frame,docs,portal,kb,gov TO intune_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA rpt TO intune_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov TO intune_app;
+
+REVOKE UPDATE, DELETE, TRUNCATE ON core.audit_log FROM intune_app, intune_readonly;
+
+-- The web tier. CRITICAL: NOBYPASSRLS is the whole security model.
+CREATE USER intune_web WITH PASSWORD :'web_pw' NOBYPASSRLS IN ROLE intune_app;
+CREATE USER metabase_app WITH PASSWORD :'metabase_pw' NOBYPASSRLS IN ROLE intune_readonly;
+
+ALTER ROLE intune_web SET row_security = on;
+ALTER ROLE metabase_app SET row_security = on;
+
+-- Force RLS even for table owners
+ALTER TABLE crm.client FORCE ROW LEVEL SECURITY;
+ALTER TABLE docs.document FORCE ROW LEVEL SECURITY;
+ALTER TABLE engage.case FORCE ROW LEVEL SECURITY;
+ALTER TABLE intake.kyc_case FORCE ROW LEVEL SECURITY;
+ALTER TABLE intake.sar_case FORCE ROW LEVEL SECURITY;
+```
+
+---
+
+## THE THREE OPEN DECISIONS, RESOLVED
+
+**1. Portal engine** — settled by your call. Next.js serves both surfaces from one codebase; `/(admin)` and `/(portal)` route groups share the RLS layer, and `session.isStaff` plus `fn_visible_clients()` do the separation. One deployment, one auth model, no NocoBase coupling.
+
+**2 & 3 still stand:**
+- **Screening provider** — the `screening.run` job needs a concrete target. OFAC SDN direct XML parse is free and I can write the parser; Dow Jones/WorldCheck need a contract and credentials.
+- **`evidence.tier` ordering** — `tier_i` as *strongest* means `e.tier <= v_min` reads "at least as strong as required." Confirm, or I invert the comparison.
+
+## WHAT'S NOT BUILT YET
+
+The backend spine is here. Remaining, in the order I'd sequence them:
+
+1. **`intake.form_template` JSON Schema definitions** — the actual KYC/KYB/AML field sets. Your infographic implies specific ones; I need your intake forms to encode them faithfully rather than invent them.
+2. **Report rendering** — assessment → PDF (Playwright or react-pdf), the ICAEF Statement of Findings and Examination Report as templates.
+3. **Stripe billing** — engagement → invoice → AR aging.
+4. **Entra ID OIDC** — federated staff login alongside the local path.
+5. **RAG retrieval endpoint** — `kb.chunk` has the HNSW index; the query path and Claude integration are unwritten.
+
+Which one next?
