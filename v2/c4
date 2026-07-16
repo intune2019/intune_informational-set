@@ -1,0 +1,225 @@
+Fair — I was building before I understood the domain. Let me answer the actual question.
+
+But it splits three ways depending on **who you are**, and In.Tune sits in an unusual spot: you're a *service provider* to regulated entities, you're a *government contractor*, and you're a *trust services participant* (GlobalSign RA). Those are three different compliance surfaces. Most firms only have one.
+
+---
+
+## 1. WHAT APPLIES TO IN.TUNE ITSELF
+
+This is the part people skip. You can't credibly assess someone else's control environment while your own is undocumented.
+
+| Obligation | Why it bites you | Trigger |
+|---|---|---|
+| **FTC Safeguards Rule** (16 CFR 314) | You handle client financial data. If you're a "finding" or "servicing" entity for financial products, you're a *financial institution* under GLBA — the 2021 amendments swept in far more service providers than people expect. Requires named Qualified Individual, written risk assessment, encryption, MFA, incident response plan, annual board report. | Likely **already applies** |
+| **FAR 52.204-21** | Basic safeguarding of Federal Contract Information. 15 controls. | Any federal contract |
+| **NIST SP 800-171 / CMMC Level 2** | If you touch Controlled Unclassified Information. 110 controls, SPRS score posted, third-party assessment under CMMC. | CUI in scope |
+| **CA/Browser Forum Baseline Requirements** + **WebTrust for RAs** | You're a GlobalSign RA. Your RA agreement almost certainly flows down BR §5 (management/operational controls), identity vetting procedures, and audit obligations. This is a real, examinable obligation. | **Already applies** |
+| **AICPA independence / SSAE 18** | If you issue anything resembling an attestation report, you're in AT-C territory whether you meant to be or not. | Depends on report form |
+| **State privacy** (TX DPSA, CCPA/CPRA if CA clients) | Texas Data Privacy and Security Act is live. | Threshold-based |
+| **SOC 2 Type II** | Not law. But your clients' vendor risk teams will demand it, and you won't win regulated-entity work without one. | Market reality |
+
+The RA obligation is the one I'd flag hardest. Being a Registration Authority means a CA has delegated identity vetting to you, and that delegation carries audit exposure. Most firms with an RA agreement don't fully internalize that.
+
+---
+
+## 2. WHAT APPLIES TO YOUR CLIENTS (your assessment scope)
+
+**Banks / credit unions / MSBs**
+- BSA/AML: 31 CFR Chapter X — CIP (1020.220), CDD/beneficial ownership (1010.230), SAR (1020.320), CTR, OFAC
+- **AML Act 2020 / CTA beneficial ownership reporting** — status has shifted repeatedly; verify current posture before relying on anything I say here
+- FFIEC IT Examination Handbook + FFIEC BSA/AML Manual
+- GLBA privacy + Safeguards
+- Reg E, Reg Z, Reg DD, UDAAP
+- Interagency guidance on third-party relationships (2023)
+
+**Public companies**
+- SOX 302/404/802, PCAOB AS 2201, COSO 2013 (the ICFR framework of record)
+- SEC cyber disclosure rules (Item 1.05 8-K, Reg S-K 106)
+
+**Investment advisers / broker-dealers**
+- Advisers Act; SEC marketing rule; Reg S-P (amended 2024 — incident response + notification); Reg S-ID
+- FINRA 3110/3120; SEC Reg SCI for market infrastructure
+
+**Payments / cards**
+- PCI DSS v4.0.1 — v4.0 requirements became mandatory March 2025
+
+**Government contractors**
+- FAR/DFARS, CMMC, GAO Green Book (federal ICFR), OMB A-123, Single Audit / Uniform Guidance for grant recipients
+
+**Cross-cutting frameworks**
+- NIST CSF 2.0 (now has a Govern function — maps directly to your GRC-A™)
+- NIST SP 800-53 Rev 5, ISO 27001:2022, ISO 31000, COSO ERM
+- Basel III operational risk, DORA (EU financial entities), SWIFT CSP
+
+---
+
+## 3. WHY THIS MATTERS FOR THE SCHEMA
+
+Everything above is **`frame.external_standard` + `frame.external_control` + `frame.crosswalk`**. The tables already exist. What's missing is the actual control text, which is thousands of rows and mostly copyrighted — NIST and GAO are public domain, ISO and PCI and COSO are licensed and I can't reproduce them.
+
+That has a design consequence worth stating: for licensed frameworks, you store the **reference** (`ISO-27001:A.5.1`) and your own crosswalk rationale, not the control text. The text stays in your licensed copy. This is normal GRC-tool practice and it's why every commercial GRC platform makes you upload your own ISO standard.
+
+---
+
+## THE THING I ACTUALLY NEED
+
+I've now written a lot of schema against guesses. Rather than guess again:
+
+**Which of these is In.Tune's real center of gravity?**
+
+**(A) Assessor** — you examine clients against these frameworks. The schema's center is `frame.assessment` → `workpaper` → `evidence` → `finding`. KYC on your clients is engagement acceptance only. No SAR table.
+
+**(B) Program operator** — you *run* AML/compliance programs for clients. The center is `intake` + `sensitive.screening` + `sar_case`. You need the full CIP/CDD instrument.
+
+**(C) RA / trust services** — the center is `frame.certificate` + identity vetting under CA/B Forum BRs, and the KYB form is really an OV/EV vetting record.
+
+**(D) All three, separate service lines** — then they're separate engagement types with separate data models sharing the party hub, and I should stop trying to make one KYC form serve all of them.
+
+My read from your capability statement is **D**, with A as the largest. But I've now been wrong twice by inferring, so I'd rather you tell me.
+
+And the practical question underneath: **do you have In.Tune's own written information security program, AML program, and RA practice statement?** If yes, those documents *are* the seed data — they define your controls, and the schema should encode them rather than my invented ones. If no, that's arguably the first deliverable, and it's the one a regulated client's vendor-risk team will ask for before they'll sign.
+  Then here's the sequence, and it matters that it goes in this order.
+
+**Your documents come first, and they're the seed data.** Your WISP, AML program, and RA practice statement define real controls with real owners and real frequencies. Those populate `gov.policy` and `gov.control`. Your five frameworks — GRC-A™, ICAEF™, REG-C™, TRM™, TrustFabric™ — populate `frame.framework` → `domain` → `control_objective` → `test_procedure`. The crosswalk table then binds your objectives to NIST/ISO/FFIEC/PCI references.
+
+That crosswalk is the actual product. It's what lets you say to a bank: *"GRC-A™ domain FTC objective 03 maps to FFIEC BSA/AML Manual — Internal Controls, NIST CSF 2.0 GV.RM-01, and COSO Principle 10, and here are the workpapers that tested it."* One test, many attestations. That's the thing commercial GRC tools charge six figures for, and your five frameworks are already structured to do it.
+
+**The integration architecture — how the five frameworks compose:**
+
+```
+                    ┌─────────────────────────────┐
+                    │  GRC-A™  (governance layer) │
+                    │  "Can it govern itself?"     │
+                    └──────────────┬──────────────┘
+                                   │ produces findings
+                                   │ consumes evidence
+       ┌───────────────┬───────────┼───────────┬───────────────┐
+       │               │           │           │               │
+ ┌─────┴─────┐  ┌──────┴────┐  ┌───┴────┐  ┌───┴──────┐       │
+ │  REG-C™   │  │   TRM™    │  │ Trust  │  │ (future) │       │
+ │ regulatory│  │ treasury  │  │Fabric™ │  │          │       │
+ │ scrutiny  │  │ resources │  │identity│  │          │       │
+ └─────┬─────┘  └──────┬────┘  └───┬────┘  └──────────┘       │
+       │               │           │                           │
+       └───────────────┴───────────┴───────────────────────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │  ICAEF™  (evidentiary layer) │
+                    │  "Can it be defended?"       │
+                    │  ── governs HOW all four are │
+                    │     tested. Not a peer.      │
+                    └─────────────────────────────┘
+```
+
+ICAEF isn't a sibling of the other four — it's the method layer underneath all of them. Your own infographic says it: *"Establishes methodology for examinations."* That means `frame.test_procedure` and `frame.evidence` are ICAEF's tables, and GRC-A/REG-C/TRM/TrustFabric supply the objectives that get tested through them. The `min_evidence_tier` column and the `fn_require_evidence()` trigger I already wrote are ICAEF enforcement — they're the reason a GRC-A finding can't exist without a defensible evidence chain.
+
+That's a structural claim about your methodology, and it's the kind of thing I should check rather than assert. If ICAEF is meant to be a peer framework with its own engagements, the model changes.
+
+---
+
+**Now — the actual blocker.**
+
+You said "yes" to having the documents. They're not in this conversation. What's uploaded is capability statements, infographics, and `MGP-ES.pdf`. None of those are your WISP, AML program, or RA practice statement.
+
+I can't seed `gov.control` from a capability statement. And I've now built two full schema layers on inference and been corrected twice — I'd rather not make it three.
+
+**Upload the documents.** Specifically:
+1. **WISP / information security program** — becomes `gov.policy` + `gov.control` rows
+2. **AML program** — becomes `intake.risk_factor` weights and the CIP/CDD form templates
+3. **RA practice statement / GlobalSign RA agreement** — becomes the TrustFabric vetting procedures and `frame.certificate` lifecycle controls
+4. **Anything defining the five frameworks in prose** — domains, objectives, exam points, evidence tiers, rating criteria
+
+Drop any subset. Even one gets us off guesswork and into encoding.
+
+**And answer the A/B/C/D question from my last message** — assessor, program operator, RA, or all three as separate service lines. It determines whether `intake` is engagement-acceptance or a client-facing AML program, and that's a fork I can't paper over.
+
+Give me those and the next output is: framework seed DDL from your actual methodology, the crosswalk rows binding your objectives to NIST CSF 2.0 and FFIEC, your controls in `gov.control` with real owners and frequencies, and the intake templates built from your AML program rather than my reading of 31 CFR.
+
+  That's the correction I needed. ICAEF isn't a method layer beneath the others — **all five are fieldwork engagements.** You sell a GRC-A™ audit. You sell a TRM™ audit. Each has its own scope, its own fieldwork, its own report.
+
+Which means `frame.assessment` isn't the right center. **The engagement is the audit**, and the audit has phases — the Day 1 / Day 2 / Day 3 / Day 4 structure in your Financial Services Compliance Enablement Assessment infographic. Discovery & Scoping → Control Assessment → Gap Analysis & Risk Evaluation → Recommendations & Executive Review. That's a fieldwork program, and it should be data.
+
+So the model is:
+
+```
+engagement (sold: "GRC-A™ audit of Client X")
+  └─ audit_program        ← the scoped plan: which domains, which objectives
+       └─ phase           ← Day 1..N, or Planning/Fieldwork/Reporting
+            └─ procedure_step   ← what gets done, by whom, when
+                 └─ workpaper   ← the execution record
+                      └─ evidence  ← what backs the conclusion
+                           └─ finding → recommendation → remediation
+```
+
+And the thing that makes this *yours* rather than generic audit software: each of the five frameworks supplies a different **objective library**, but they all run through the same fieldwork machinery. GRC-A asks "can this org govern itself" — five domains, governance maturity output. TRM asks "are financial resources governed" — treasury/liquidity/transaction/banking/fraud, treasury control register output. Same engine, different question, different deliverable.
+
+That's a big restructure and I want to build it right this time rather than fast.
+
+---
+
+**Two things, and then I write it.**
+
+**1. What does fieldwork actually look like for you?** Your infographic shows a 4-day engagement. Is that the standard shape — a fixed-duration onsite with a daily agenda — or does it vary by framework? Specifically:
+- Is a TRM™ audit also 4 days, or is it different?
+- Are the phases time-boxed (Day 1, Day 2) or state-based (Planning → Fieldwork → Reporting, however long each takes)?
+- Do you do interviews as a first-class artifact? The Day 1 box says "Interviews" — those need their own table if they're evidence.
+
+**2. Still unanswered, and I keep needing it:** upload the framework documents. GRC-A's five domains I can read off the infographic. Its *objectives* and *exam points* I can't — the infographic text is garbled ("Governanncity accountyability", "Previess Maturity & Authorenenation Management"). The evidence tier definitions in ICAEF are illegible too, and those drive the `min_evidence_tier` logic.
+
+I can build the fieldwork engine from the structure. I cannot populate your objective libraries from an AI-generated infographic with corrupted text — and if I invent GRC-A's objectives, you'll be auditing clients against controls I made up, which is exactly the failure mode this whole system exists to prevent.
+
+So: **the framework docs, or even a plain list of GRC-A's objectives per domain**, and answers on fieldwork shape. Then I write the audit engine — `audit_program`, `phase`, `procedure_step`, interview capture, PBC/request lists tied to phases, evidence chain, finding generation, and the report assembly — against your actual methodology.
+
+
+
+  That's the piece I was missing. Each framework is a **complete instrument**: an intake form, a scored risk model, a control library, and a report that comes out the other end. Not five variations on generic audit software — five distinct products that share one engine.
+
+Let me name the shape before I build it, because if I have this wrong we're on attempt four.
+
+**The instrument pattern, applied to all five:**
+
+```
+FRAMEWORK (e.g. TRM™)
+  │
+  ├─ INSTRUMENT ──── the form. Sections → questions → response types.
+  │                   Versioned. What you send/administer during fieldwork.
+  │
+  ├─ RISK MODEL ──── scoring. Each response maps to a risk contribution.
+  │                   Weights → domain scores → maturity level → overall rating.
+  │
+  ├─ CONTROL LIBRARY ─ objectives → test procedures → evidence requirements.
+  │                     What the form's answers get *tested* against.
+  │
+  ├─ CROSSWALK ────── objective → NIST/FFIEC/ISO/COSO reference.
+  │                    Makes one test satisfy many attestations.
+  │
+  └─ REPORT SPEC ──── deliverable definition. Which sections, which
+                       computed outputs, which visualizations.
+                       GRC-A → Governance Maturity Rating + Risk Register
+                       TRM → Treasury Control Register + Liquidity Risk Review
+                       ICAEF → Statement of Findings + Examination Report
+                       REG-C → Regulatory Readiness Assessment + Traceability Matrix
+                       TrustFabric → Trust Architecture Design + Identity Governance Model
+```
+
+The outputs listed there come straight off your infographic — those boxes at the bottom of each framework card are report specs. That's what tells me this reading is right: you already designed the deliverables.
+
+**What this means structurally:** the form isn't separate from the audit. The instrument *is* the fieldwork. You administer it, responses generate risk scores, scores drive findings, findings assemble into the report. `intake.form_template` and `frame.test_procedure` aren't two things — they're the same instrument viewed from the response side and the testing side.
+
+That's a real design decision and I want to confirm it rather than assume: **is the form the instrument, or is the form an intake questionnaire that precedes the testing?** Both are defensible. If they're one thing, a question and its test procedure are the same row. If they're two, the questionnaire scopes the engagement and the test procedures are what the assessor executes afterward.
+
+---
+
+**I can build the engine now.** Generic across all five, with report generation. What I still cannot do is populate the libraries.
+
+You've told me twice you have the framework material. It hasn't come through — what's uploaded is capability statements and infographics with garbled AI-generated text. I can read GRC-A's five domain *names*. I cannot read its objectives, its exam points, its scoring weights, or ICAEF's evidence tier definitions.
+
+So here's my proposal, and it gets you moving today:
+
+**I build the engine and demonstrate it fully instantiated on ONE framework — TRM™** — because treasury is where your infographic is most legible and where your CTP background means you'll catch my errors instantly. Full stack: instrument DDL, the five treasury domains with objectives I draft, risk scoring, control library, crosswalk to FFIEC/NIST, and the report generator producing a Treasury Control Register and Liquidity Risk Review.
+
+You then look at my TRM objectives and tell me where I'm wrong. Once TRM is right, the other four are the same pattern with your content — and by then you'll see exactly what shape the content needs to be in to hand me.
+
+Alternative: **paste GRC-A's objectives as plain text.** Even rough bullets. Then I build against real methodology instead of my draft.
+
+Which way? And the form-is-instrument question above — that one I need either way.
