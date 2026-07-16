@@ -1,0 +1,3 @@
+I'll build it as a standalone artifact — a working fieldwork instrument that runs in the browser with no backend, no database, no dependencies. Persists locally, exports its own data.
+
+Let me check the design skill first.Here's the working instrument. Standalone HTML file — open it in a browser, no server, no install. It saves to localStorage as you type and exports JSON that maps directly onto the `inst.*` schema when you're ready to wire it up.I'll build this as a data-driven engine — the framework definition is a JSON object at the top, so you edit content without touching code.
