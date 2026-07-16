@@ -1,0 +1,2627 @@
+I'm going to give you the full In.Tune ERP schema. This is a large build — I'll structure it as a complete PostgreSQL deployment.
+
+## SECTION 1: ARCHITECTURE
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  EDGE: NGINX + Cloudflare + Let's Encrypt               │
+├─────────────────────────────────────────────────────────┤
+│  APP: NocoBase (admin/ops)  │  Supabase (client portal) │
+├─────────────────────────────────────────────────────────┤
+│  DATA: PostgreSQL 16  │  Redis  │  MinIO (documents)    │
+├─────────────────────────────────────────────────────────┤
+│  JOBS: pg_cron (in-DB)  │  n8n (external integrations)  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Schema separation strategy** — 10 PostgreSQL schemas, each mapping to a business domain:
+
+| Schema | Domain |
+|---|---|
+| `core` | Tenancy, users, orgs, audit, RBAC |
+| `crm` | Clients, contacts, entities, relationships |
+| `intake` | KYC/KYB/AML onboarding, screening |
+| `engage` | Engagements, projects, cases, time |
+| `frame` | GRC-A™, ICAEF™, REG-C™, TRM™, TrustFabric™ |
+| `docs` | Document center, versioning, retention |
+| `portal` | Client portal, sharing, requests |
+| `kb` | Knowledge base, R&D, recommendations |
+| `gov` | Policies, controls, risk register |
+| `rpt` | Materialized views, reporting |
+
+---
+
+## SECTION 2: DATABASE FOUNDATION
+
+```sql
+-- ============================================================
+-- IN.TUNE ERP :: 00_FOUNDATION
+-- PostgreSQL 16+
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+CREATE EXTENSION IF NOT EXISTS "btree_gist";
+CREATE EXTENSION IF NOT EXISTS "pg_cron";
+CREATE EXTENSION IF NOT EXISTS "vector";        -- RAG / KB embeddings
+
+CREATE SCHEMA IF NOT EXISTS core;
+CREATE SCHEMA IF NOT EXISTS crm;
+CREATE SCHEMA IF NOT EXISTS intake;
+CREATE SCHEMA IF NOT EXISTS engage;
+CREATE SCHEMA IF NOT EXISTS frame;
+CREATE SCHEMA IF NOT EXISTS docs;
+CREATE SCHEMA IF NOT EXISTS portal;
+CREATE SCHEMA IF NOT EXISTS kb;
+CREATE SCHEMA IF NOT EXISTS gov;
+CREATE SCHEMA IF NOT EXISTS rpt;
+
+-- ---------- ENUMS ----------
+CREATE TYPE core.record_status AS ENUM
+  ('draft','active','inactive','archived','deleted');
+
+CREATE TYPE core.risk_rating AS ENUM
+  ('low','moderate','elevated','high','critical');
+
+CREATE TYPE frame.exam_rating AS ENUM
+  ('effective','partially_effective','deficient','critical_exposure');
+
+CREATE TYPE frame.evidence_tier AS ENUM
+  ('tier_i','tier_ii','tier_iii','tier_iv');
+
+CREATE TYPE intake.kyc_status AS ENUM
+  ('not_started','in_progress','pending_review','info_requested',
+   'approved','rejected','expired','remediation');
+
+CREATE TYPE engage.engagement_status AS ENUM
+  ('prospect','proposed','contracted','active','on_hold',
+   'closing','closed','terminated');
+
+-- ---------- AUDIT CONTRACT (mixin applied to every table) ----------
+-- created_by, created_at, updated_by, updated_at, record_status
+
+-- ---------- SESSION CONTEXT ----------
+CREATE OR REPLACE FUNCTION core.current_actor()
+RETURNS UUID LANGUAGE sql STABLE AS $$
+  SELECT NULLIF(current_setting('app.actor_id', true),'')::uuid;
+$$;
+
+CREATE OR REPLACE FUNCTION core.current_tenant()
+RETURNS UUID LANGUAGE sql STABLE AS $$
+  SELECT NULLIF(current_setting('app.tenant_id', true),'')::uuid;
+$$;
+
+-- ---------- AUDIT TRIGGER ----------
+CREATE OR REPLACE FUNCTION core.fn_audit_stamp()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.created_at := COALESCE(NEW.created_at, now());
+    NEW.created_by := COALESCE(NEW.created_by, core.current_actor());
+  END IF;
+  NEW.updated_at := now();
+  NEW.updated_by := COALESCE(core.current_actor(), NEW.updated_by);
+  RETURN NEW;
+END $$;
+
+-- ---------- IMMUTABLE AUDIT LOG ----------
+CREATE TABLE core.audit_log (
+  audit_id        BIGSERIAL PRIMARY KEY,
+  tenant_id       UUID,
+  actor_id        UUID,
+  action          TEXT NOT NULL CHECK (action IN ('INSERT','UPDATE','DELETE')),
+  schema_name     TEXT NOT NULL,
+  table_name      TEXT NOT NULL,
+  record_pk       TEXT NOT NULL,
+  old_data        JSONB,
+  new_data        JSONB,
+  changed_fields  TEXT[],
+  client_ip       INET,
+  occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  row_hash        TEXT,          -- SHA-256 chain
+  prev_hash       TEXT
+) PARTITION BY RANGE (occurred_at);
+
+CREATE INDEX ix_audit_tenant_time ON core.audit_log (tenant_id, occurred_at DESC);
+CREATE INDEX ix_audit_table       ON core.audit_log (schema_name, table_name, record_pk);
+CREATE INDEX ix_audit_actor       ON core.audit_log (actor_id, occurred_at DESC);
+
+REVOKE UPDATE, DELETE ON core.audit_log FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION core.fn_audit_capture()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  v_old JSONB; v_new JSONB; v_pk TEXT; v_changed TEXT[];
+  v_prev TEXT; v_hash TEXT;
+BEGIN
+  IF TG_OP = 'DELETE' THEN v_old := to_jsonb(OLD);
+  ELSIF TG_OP = 'INSERT' THEN v_new := to_jsonb(NEW);
+  ELSE v_old := to_jsonb(OLD); v_new := to_jsonb(NEW);
+  END IF;
+
+  v_pk := COALESCE(v_new, v_old) ->> (TG_ARGV[0]);
+
+  IF TG_OP = 'UPDATE' THEN
+    SELECT array_agg(key) INTO v_changed
+    FROM jsonb_each(v_new)
+    WHERE v_new -> key IS DISTINCT FROM v_old -> key
+      AND key NOT IN ('updated_at','updated_by');
+    IF v_changed IS NULL THEN RETURN NEW; END IF;
+  END IF;
+
+  SELECT row_hash INTO v_prev FROM core.audit_log
+   ORDER BY audit_id DESC LIMIT 1;
+
+  v_hash := encode(digest(
+      COALESCE(v_prev,'') || TG_OP || TG_TABLE_NAME ||
+      COALESCE(v_pk,'') || COALESCE(v_new::text,'') || now()::text,
+      'sha256'), 'hex');
+
+  INSERT INTO core.audit_log (
+    tenant_id, actor_id, action, schema_name, table_name, record_pk,
+    old_data, new_data, changed_fields, client_ip, row_hash, prev_hash)
+  VALUES (
+    core.current_tenant(), core.current_actor(), TG_OP,
+    TG_TABLE_SCHEMA, TG_TABLE_NAME, v_pk,
+    v_old, v_new, v_changed, inet_client_addr(), v_hash, v_prev);
+
+  RETURN COALESCE(NEW, OLD);
+END $$;
+
+-- Partition helper (called by cron)
+CREATE OR REPLACE FUNCTION core.fn_ensure_audit_partitions(p_months INT DEFAULT 3)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE d DATE; nm TEXT;
+BEGIN
+  FOR i IN 0..p_months LOOP
+    d := date_trunc('month', now())::date + (i || ' month')::interval;
+    nm := 'audit_log_' || to_char(d,'YYYY_MM');
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = nm) THEN
+      EXECUTE format(
+        'CREATE TABLE core.%I PARTITION OF core.audit_log
+         FOR VALUES FROM (%L) TO (%L)',
+        nm, d, (d + interval '1 month')::date);
+    END IF;
+  END LOOP;
+END $$;
+
+SELECT core.fn_ensure_audit_partitions(6);
+
+-- ---------- BULK TRIGGER ATTACHER ----------
+CREATE OR REPLACE FUNCTION core.fn_attach_standard_triggers(
+  p_schema TEXT, p_table TEXT, p_pk TEXT)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format(
+    'DROP TRIGGER IF EXISTS trg_stamp ON %I.%I;
+     CREATE TRIGGER trg_stamp BEFORE INSERT OR UPDATE ON %I.%I
+     FOR EACH ROW EXECUTE FUNCTION core.fn_audit_stamp();',
+     p_schema,p_table,p_schema,p_table);
+  EXECUTE format(
+    'DROP TRIGGER IF EXISTS trg_audit ON %I.%I;
+     CREATE TRIGGER trg_audit AFTER INSERT OR UPDATE OR DELETE ON %I.%I
+     FOR EACH ROW EXECUTE FUNCTION core.fn_audit_capture(%L);',
+     p_schema,p_table,p_schema,p_table,p_pk);
+END $$;
+```
+
+---
+
+## SECTION 3: CORE — TENANCY, IDENTITY, RBAC
+
+```sql
+-- ============================================================
+-- 01_CORE
+-- ============================================================
+
+CREATE TABLE core.tenant (
+  tenant_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_code   TEXT NOT NULL UNIQUE,
+  legal_name    TEXT NOT NULL,
+  is_internal   BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE core.app_user (
+  user_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  email         CITEXT NOT NULL,
+  full_name     TEXT NOT NULL,
+  phone         TEXT,
+  is_staff      BOOLEAN NOT NULL DEFAULT false,
+  mfa_enrolled  BOOLEAN NOT NULL DEFAULT false,
+  entra_oid     TEXT UNIQUE,           -- Entra ID object id
+  last_login_at TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_user_email UNIQUE (tenant_id, email)
+);
+
+CREATE TABLE core.role (
+  role_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  role_code   TEXT NOT NULL UNIQUE,
+  role_name   TEXT NOT NULL,
+  scope       TEXT NOT NULL CHECK (scope IN ('internal','client','system')),
+  description TEXT,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE core.permission (
+  permission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  perm_code     TEXT NOT NULL UNIQUE,    -- e.g. 'intake.kyc.approve'
+  resource      TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  description   TEXT
+);
+
+CREATE TABLE core.role_permission (
+  role_id       UUID NOT NULL REFERENCES core.role(role_id) ON DELETE CASCADE,
+  permission_id UUID NOT NULL REFERENCES core.permission(permission_id) ON DELETE CASCADE,
+  PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE core.user_role (
+  user_id    UUID NOT NULL REFERENCES core.app_user(user_id) ON DELETE CASCADE,
+  role_id    UUID NOT NULL REFERENCES core.role(role_id) ON DELETE CASCADE,
+  granted_by UUID,
+  granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ,
+  PRIMARY KEY (user_id, role_id)
+);
+
+-- Segregation of Duties conflicts
+CREATE TABLE core.sod_conflict (
+  sod_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  role_a_id    UUID NOT NULL REFERENCES core.role(role_id),
+  role_b_id    UUID NOT NULL REFERENCES core.role(role_id),
+  severity     core.risk_rating NOT NULL DEFAULT 'high',
+  rationale    TEXT NOT NULL,
+  CONSTRAINT ck_sod_distinct CHECK (role_a_id <> role_b_id)
+);
+
+-- Reference/lookup pattern
+CREATE TABLE core.lookup_set (
+  set_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  set_code TEXT NOT NULL UNIQUE,
+  set_name TEXT NOT NULL
+);
+
+CREATE TABLE core.lookup_value (
+  value_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  set_id     UUID NOT NULL REFERENCES core.lookup_set(set_id) ON DELETE CASCADE,
+  value_code TEXT NOT NULL,
+  label      TEXT NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  is_active  BOOLEAN NOT NULL DEFAULT true,
+  meta       JSONB DEFAULT '{}'::jsonb,
+  CONSTRAINT uq_lookup UNIQUE (set_id, value_code)
+);
+
+CREATE TABLE core.notification (
+  notification_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  user_id     UUID REFERENCES core.app_user(user_id),
+  channel     TEXT NOT NULL CHECK (channel IN ('email','in_app','sms','webhook')),
+  subject     TEXT,
+  body        TEXT,
+  payload     JSONB,
+  status      TEXT NOT NULL DEFAULT 'queued'
+              CHECK (status IN ('queued','sent','failed','suppressed')),
+  attempts    INT NOT NULL DEFAULT 0,
+  send_after  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at     TIMESTAMPTZ,
+  error_text  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_notif_pending ON core.notification (status, send_after)
+  WHERE status = 'queued';
+```
+
+---
+
+## SECTION 4: CRM — CLIENTS & ENTITIES
+
+```sql
+-- ============================================================
+-- 02_CRM
+-- ============================================================
+
+CREATE TABLE crm.client (
+  client_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id       UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_number   TEXT NOT NULL UNIQUE,
+  legal_name      TEXT NOT NULL,
+  dba_name        TEXT,
+  entity_type     TEXT NOT NULL CHECK (entity_type IN
+                  ('corporation','llc','llp','partnership','sole_prop',
+                   'nonprofit','government','trust','individual','other')),
+  jurisdiction    TEXT,
+  formation_date  DATE,
+  ein_enc         BYTEA,                       -- pgcrypto encrypted
+  duns_number     TEXT,
+  cage_code       TEXT,
+  uei_number      TEXT,
+  naics_codes     TEXT[],
+  website         TEXT,
+  industry_sector TEXT,
+  is_regulated    BOOLEAN NOT NULL DEFAULT false,
+  regulators      TEXT[],                      -- FDIC, OCC, SEC, FINRA...
+  risk_rating     core.risk_rating,
+  onboarded_at    TIMESTAMPTZ,
+  relationship_owner UUID REFERENCES core.app_user(user_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'draft'
+);
+CREATE INDEX ix_client_tenant ON crm.client (tenant_id, record_status);
+CREATE INDEX ix_client_name_trgm ON crm.client USING gin (legal_name gin_trgm_ops);
+
+CREATE TABLE crm.address (
+  address_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id   UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  address_type TEXT NOT NULL CHECK (address_type IN
+                ('registered','mailing','physical','billing','other')),
+  line1 TEXT NOT NULL, line2 TEXT,
+  city TEXT NOT NULL, state_province TEXT,
+  postal_code TEXT, country_code CHAR(2) NOT NULL DEFAULT 'US',
+  is_primary  BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE crm.contact (
+  contact_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id   UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  first_name  TEXT NOT NULL,
+  last_name   TEXT NOT NULL,
+  title       TEXT,
+  email       CITEXT,
+  phone       TEXT,
+  is_primary  BOOLEAN NOT NULL DEFAULT false,
+  is_signatory BOOLEAN NOT NULL DEFAULT false,
+  portal_user_id UUID REFERENCES core.app_user(user_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE UNIQUE INDEX uq_contact_primary ON crm.contact (client_id)
+  WHERE is_primary AND record_status = 'active';
+
+-- Beneficial ownership (KYB requirement, FinCEN CDD Rule)
+CREATE TABLE crm.beneficial_owner (
+  bo_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id    UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  person_name  TEXT NOT NULL,
+  dob          DATE,
+  ssn_enc      BYTEA,
+  passport_enc BYTEA,
+  nationality  CHAR(2),
+  ownership_pct NUMERIC(5,2) CHECK (ownership_pct BETWEEN 0 AND 100),
+  is_control_person BOOLEAN NOT NULL DEFAULT false,
+  is_pep       BOOLEAN NOT NULL DEFAULT false,
+  pep_details  TEXT,
+  verified_at  TIMESTAMPTZ,
+  verified_by  UUID REFERENCES core.app_user(user_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_bo_client ON crm.beneficial_owner (client_id);
+
+-- Corporate structure / parent-subsidiary (self-referential M:N)
+CREATE TABLE crm.client_relationship (
+  relationship_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_client_id UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  child_client_id  UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  relationship_type TEXT NOT NULL CHECK (relationship_type IN
+                    ('parent','subsidiary','affiliate','jv','vendor','counterparty')),
+  ownership_pct NUMERIC(5,2),
+  effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+  effective_to   DATE,
+  CONSTRAINT ck_rel_distinct CHECK (parent_client_id <> child_client_id),
+  CONSTRAINT uq_rel UNIQUE (parent_client_id, child_client_id, relationship_type)
+);
+
+CREATE TABLE crm.bank_account (
+  bank_account_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  institution_name TEXT NOT NULL,
+  account_nickname TEXT,
+  account_number_enc BYTEA NOT NULL,
+  account_last4  CHAR(4),
+  routing_enc    BYTEA,
+  currency_code  CHAR(3) NOT NULL DEFAULT 'USD',
+  account_purpose TEXT,
+  signatories    UUID[],
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+```
+
+---
+
+## SECTION 5: INTAKE — KYC / KYB / AML
+
+```sql
+-- ============================================================
+-- 03_INTAKE
+-- ============================================================
+
+CREATE TABLE intake.form_template (
+  template_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  template_code TEXT NOT NULL,
+  version       INT NOT NULL DEFAULT 1,
+  title         TEXT NOT NULL,
+  form_type     TEXT NOT NULL CHECK (form_type IN
+                ('kyc_individual','kyb_entity','aml_questionnaire',
+                 'risk_assessment','engagement_intake','vendor_due_diligence',
+                 'w9','conflict_check','custom')),
+  json_schema   JSONB NOT NULL,     -- field definitions
+  ui_schema     JSONB,
+  is_published  BOOLEAN NOT NULL DEFAULT false,
+  effective_from DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'draft',
+  CONSTRAINT uq_template_version UNIQUE (template_code, version)
+);
+
+CREATE TABLE intake.form_submission (
+  submission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  template_id   UUID NOT NULL REFERENCES intake.form_template(template_id),
+  client_id     UUID REFERENCES crm.client(client_id),
+  contact_id    UUID REFERENCES crm.contact(contact_id),
+  submitted_by  UUID REFERENCES core.app_user(user_id),
+  payload       JSONB NOT NULL,
+  payload_hash  TEXT NOT NULL,       -- integrity seal
+  status        intake.kyc_status NOT NULL DEFAULT 'in_progress',
+  submitted_at  TIMESTAMPTZ,
+  ip_address    INET,
+  user_agent    TEXT,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_sub_client ON intake.form_submission (client_id, status);
+CREATE INDEX ix_sub_payload ON intake.form_submission USING gin (payload jsonb_path_ops);
+
+CREATE TABLE intake.kyc_case (
+  kyc_case_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id),
+  case_number   TEXT NOT NULL UNIQUE,
+  case_type     TEXT NOT NULL CHECK (case_type IN
+                ('initial_onboarding','periodic_review','event_driven',
+                 'enhanced_due_diligence','remediation')),
+  status        intake.kyc_status NOT NULL DEFAULT 'not_started',
+  risk_rating   core.risk_rating,
+  risk_score    NUMERIC(5,2),
+  cdd_level     TEXT CHECK (cdd_level IN ('simplified','standard','enhanced')),
+  assigned_to   UUID REFERENCES core.app_user(user_id),
+  reviewed_by   UUID REFERENCES core.app_user(user_id),
+  approved_by   UUID REFERENCES core.app_user(user_id),
+  opened_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_at    TIMESTAMPTZ,
+  next_review_due DATE,
+  decision_rationale TEXT,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  -- Four-eyes: approver cannot be reviewer
+  CONSTRAINT ck_four_eyes CHECK (approved_by IS NULL OR approved_by <> reviewed_by)
+);
+CREATE INDEX ix_kyc_due ON intake.kyc_case (next_review_due)
+  WHERE record_status = 'active';
+CREATE INDEX ix_kyc_status ON intake.kyc_case (status, risk_rating);
+
+CREATE TABLE intake.risk_factor (
+  factor_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  factor_code  TEXT NOT NULL UNIQUE,
+  category     TEXT NOT NULL CHECK (category IN
+               ('geographic','product','channel','customer','transaction')),
+  factor_name  TEXT NOT NULL,
+  weight       NUMERIC(5,2) NOT NULL DEFAULT 1.0,
+  scoring_rule JSONB NOT NULL,
+  is_active    BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE TABLE intake.risk_assessment (
+  assessment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kyc_case_id   UUID NOT NULL REFERENCES intake.kyc_case(kyc_case_id) ON DELETE CASCADE,
+  factor_id     UUID NOT NULL REFERENCES intake.risk_factor(factor_id),
+  raw_value     TEXT,
+  score         NUMERIC(5,2) NOT NULL,
+  weighted_score NUMERIC(6,2) GENERATED ALWAYS AS (score) STORED,
+  notes         TEXT,
+  assessed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  assessed_by   UUID REFERENCES core.app_user(user_id),
+  CONSTRAINT uq_case_factor UNIQUE (kyc_case_id, factor_id)
+);
+
+CREATE TABLE intake.screening_run (
+  screening_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kyc_case_id   UUID REFERENCES intake.kyc_case(kyc_case_id) ON DELETE CASCADE,
+  client_id     UUID REFERENCES crm.client(client_id),
+  bo_id         UUID REFERENCES crm.beneficial_owner(bo_id),
+  provider      TEXT NOT NULL,       -- ofac, un, eu, dowjones, worldcheck...
+  list_type     TEXT NOT NULL CHECK (list_type IN
+                ('sanctions','pep','adverse_media','watchlist','internal')),
+  search_term   TEXT NOT NULL,
+  request_payload JSONB,
+  response_payload JSONB,
+  hit_count     INT NOT NULL DEFAULT 0,
+  run_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  run_by        UUID REFERENCES core.app_user(user_id),
+  is_automated  BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX ix_screen_case ON intake.screening_run (kyc_case_id, run_at DESC);
+
+CREATE TABLE intake.screening_hit (
+  hit_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  screening_id  UUID NOT NULL REFERENCES intake.screening_run(screening_id) ON DELETE CASCADE,
+  matched_name  TEXT NOT NULL,
+  match_score   NUMERIC(5,2),
+  list_source   TEXT,
+  match_details JSONB,
+  disposition   TEXT NOT NULL DEFAULT 'pending'
+                CHECK (disposition IN ('pending','true_match','false_positive','escalated')),
+  disposition_notes TEXT,
+  dispositioned_by UUID REFERENCES core.app_user(user_id),
+  dispositioned_at TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_hit_pending ON intake.screening_hit (disposition)
+  WHERE disposition = 'pending';
+
+-- SAR / suspicious activity
+CREATE TABLE intake.sar_case (
+  sar_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_id     UUID REFERENCES crm.client(client_id),
+  sar_number    TEXT NOT NULL UNIQUE,
+  detected_at   TIMESTAMPTZ NOT NULL,
+  activity_summary TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open','investigating','filed','closed_no_file')),
+  filed_at      TIMESTAMPTZ,
+  fincen_bsa_id TEXT,
+  investigator  UUID REFERENCES core.app_user(user_id),
+  -- 30-day filing clock
+  filing_due_at TIMESTAMPTZ GENERATED ALWAYS AS (detected_at + INTERVAL '30 days') STORED,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+```
+
+---
+
+## SECTION 6: ENGAGE — ENGAGEMENTS, PROJECTS, CASES
+
+```sql
+-- ============================================================
+-- 04_ENGAGE
+-- ============================================================
+
+CREATE TABLE engage.service_line (
+  service_line_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code TEXT NOT NULL UNIQUE,      -- GOV, TREAS, COMP, TRUST, TECH
+  name TEXT NOT NULL,
+  description TEXT,
+  default_framework_code TEXT     -- links to frame.framework
+);
+
+CREATE TABLE engage.engagement (
+  engagement_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id      UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_id      UUID NOT NULL REFERENCES crm.client(client_id),
+  engagement_number TEXT NOT NULL UNIQUE,
+  title          TEXT NOT NULL,
+  service_line_id UUID REFERENCES engage.service_line(service_line_id),
+  status         engage.engagement_status NOT NULL DEFAULT 'prospect',
+  engagement_partner UUID REFERENCES core.app_user(user_id),
+  engagement_manager UUID REFERENCES core.app_user(user_id),
+  scope_summary  TEXT,
+  independence_confirmed BOOLEAN NOT NULL DEFAULT false,
+  conflict_check_at TIMESTAMPTZ,
+  contract_signed_at TIMESTAMPTZ,
+  start_date DATE, end_date DATE,
+  fee_type TEXT CHECK (fee_type IN ('fixed','hourly','retainer','milestone')),
+  contract_value NUMERIC(14,2),
+  currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_dates CHECK (end_date IS NULL OR end_date >= start_date),
+  CONSTRAINT ck_partner_manager CHECK (engagement_partner <> engagement_manager)
+);
+CREATE INDEX ix_eng_client ON engage.engagement (client_id, status);
+
+CREATE TABLE engage.project (
+  project_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  engagement_id UUID NOT NULL REFERENCES engage.engagement(engagement_id) ON DELETE CASCADE,
+  project_code  TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  project_type  TEXT CHECK (project_type IN
+                ('assessment','examination','implementation','advisory',
+                 'remediation','monitoring','investigation')),
+  status        TEXT NOT NULL DEFAULT 'planned'
+                CHECK (status IN ('planned','in_progress','blocked','review','complete','cancelled')),
+  lead_id       UUID REFERENCES core.app_user(user_id),
+  planned_start DATE, planned_end DATE,
+  actual_start  DATE, actual_end DATE,
+  budget_hours  NUMERIC(8,2),
+  percent_complete NUMERIC(5,2) NOT NULL DEFAULT 0
+                CHECK (percent_complete BETWEEN 0 AND 100),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_project_code UNIQUE (engagement_id, project_code)
+);
+
+CREATE TABLE engage.task (
+  task_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id   UUID NOT NULL REFERENCES engage.project(project_id) ON DELETE CASCADE,
+  parent_task_id UUID REFERENCES engage.task(task_id) ON DELETE CASCADE,
+  wbs_code     TEXT,
+  title        TEXT NOT NULL,
+  description  TEXT,
+  status       TEXT NOT NULL DEFAULT 'open'
+               CHECK (status IN ('open','in_progress','blocked','review','done','cancelled')),
+  priority     TEXT NOT NULL DEFAULT 'medium'
+               CHECK (priority IN ('low','medium','high','urgent')),
+  assignee_id  UUID REFERENCES core.app_user(user_id),
+  due_date     DATE,
+  estimate_hours NUMERIC(6,2),
+  completed_at TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_task_assignee ON engage.task (assignee_id, status, due_date);
+
+-- Generic case management (investigations, complaints, incidents)
+CREATE TABLE engage.case (
+  case_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id    UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  case_number  TEXT NOT NULL UNIQUE,
+  case_type    TEXT NOT NULL CHECK (case_type IN
+               ('investigation','complaint','incident','whistleblower',
+                'regulatory_inquiry','dispute','fraud')),
+  client_id    UUID REFERENCES crm.client(client_id),
+  engagement_id UUID REFERENCES engage.engagement(engagement_id),
+  title        TEXT NOT NULL,
+  summary      TEXT,
+  severity     core.risk_rating NOT NULL DEFAULT 'moderate',
+  status       TEXT NOT NULL DEFAULT 'open'
+               CHECK (status IN ('open','triage','investigating','pending_review','resolved','closed')),
+  is_confidential BOOLEAN NOT NULL DEFAULT false,
+  opened_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sla_due_at   TIMESTAMPTZ,
+  closed_at    TIMESTAMPTZ,
+  owner_id     UUID REFERENCES core.app_user(user_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_case_sla ON engage.case (sla_due_at) WHERE status NOT IN ('resolved','closed');
+
+CREATE TABLE engage.case_note (
+  note_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  case_id     UUID NOT NULL REFERENCES engage.case(case_id) ON DELETE CASCADE,
+  note_type   TEXT NOT NULL DEFAULT 'general'
+              CHECK (note_type IN ('general','interview','finding','decision','escalation')),
+  body        TEXT NOT NULL,
+  is_privileged BOOLEAN NOT NULL DEFAULT false,
+  author_id   UUID NOT NULL REFERENCES core.app_user(user_id),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE engage.time_entry (
+  time_entry_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES core.app_user(user_id),
+  project_id    UUID REFERENCES engage.project(project_id),
+  task_id       UUID REFERENCES engage.task(task_id),
+  case_id       UUID REFERENCES engage.case(case_id),
+  work_date     DATE NOT NULL,
+  hours         NUMERIC(5,2) NOT NULL CHECK (hours > 0 AND hours <= 24),
+  billable      BOOLEAN NOT NULL DEFAULT true,
+  rate          NUMERIC(10,2),
+  narrative     TEXT NOT NULL,
+  approved_by   UUID REFERENCES core.app_user(user_id),
+  approved_at   TIMESTAMPTZ,
+  locked        BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_time_target CHECK (num_nonnulls(project_id, case_id) >= 1)
+);
+CREATE INDEX ix_time_user_date ON engage.time_entry (user_id, work_date DESC);
+```
+
+---
+
+## SECTION 7: FRAME — THE INSTITUTIONAL STACK
+
+This is the layer that encodes GRC-A™, ICAEF™, REG-C™, TRM™, and TrustFabric™ as data rather than documents.
+
+```sql
+-- ============================================================
+-- 05_FRAME
+-- ============================================================
+
+CREATE TABLE frame.framework (
+  framework_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  framework_code TEXT NOT NULL UNIQUE,   -- GRC-A, ICAEF, REG-C, TRM, TRUSTFABRIC
+  framework_name TEXT NOT NULL,
+  version        TEXT NOT NULL DEFAULT '1.0',
+  purpose        TEXT,
+  core_question  TEXT,   -- "Can this organization govern itself effectively?"
+  is_proprietary BOOLEAN NOT NULL DEFAULT true,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE frame.domain (
+  domain_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  framework_id UUID NOT NULL REFERENCES frame.framework(framework_id) ON DELETE CASCADE,
+  domain_code  TEXT NOT NULL,
+  domain_name  TEXT NOT NULL,
+  description  TEXT,
+  sort_order   INT NOT NULL DEFAULT 0,
+  CONSTRAINT uq_domain UNIQUE (framework_id, domain_code)
+);
+
+CREATE TABLE frame.control_objective (
+  objective_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  domain_id    UUID NOT NULL REFERENCES frame.domain(domain_id) ON DELETE CASCADE,
+  objective_code TEXT NOT NULL,
+  statement    TEXT NOT NULL,
+  exam_points  TEXT[],
+  sort_order   INT NOT NULL DEFAULT 0,
+  CONSTRAINT uq_objective UNIQUE (domain_id, objective_code)
+);
+
+CREATE TABLE frame.test_procedure (
+  procedure_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  objective_id  UUID NOT NULL REFERENCES frame.control_objective(objective_id) ON DELETE CASCADE,
+  procedure_code TEXT NOT NULL,
+  procedure_text TEXT NOT NULL,
+  test_type     TEXT NOT NULL CHECK (test_type IN
+                ('inquiry','observation','inspection','reperformance','analytical')),
+  assessment_level TEXT NOT NULL CHECK (assessment_level IN
+                ('design_effectiveness','operational_effectiveness','governance_effectiveness')),
+  min_evidence_tier frame.evidence_tier NOT NULL DEFAULT 'tier_ii',
+  sample_guidance TEXT,
+  CONSTRAINT uq_procedure UNIQUE (objective_id, procedure_code)
+);
+
+-- External standard crosswalk (NIST, ISO, SOC2, PCI, GLBA, FFIEC...)
+CREATE TABLE frame.external_standard (
+  standard_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  standard_code TEXT NOT NULL UNIQUE,   -- NIST-CSF-2.0, ISO-27001-2022, SOC2-TSC
+  standard_name TEXT NOT NULL,
+  authority     TEXT,
+  version       TEXT
+);
+
+CREATE TABLE frame.external_control (
+  ext_control_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  standard_id   UUID NOT NULL REFERENCES frame.external_standard(standard_id) ON DELETE CASCADE,
+  control_ref   TEXT NOT NULL,        -- 'A.5.1', 'PR.AC-1', 'CC6.1'
+  control_text  TEXT,
+  CONSTRAINT uq_ext_control UNIQUE (standard_id, control_ref)
+);
+
+-- M:N crosswalk — the compliance traceability matrix
+CREATE TABLE frame.crosswalk (
+  crosswalk_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  objective_id   UUID NOT NULL REFERENCES frame.control_objective(objective_id) ON DELETE CASCADE,
+  ext_control_id UUID NOT NULL REFERENCES frame.external_control(ext_control_id) ON DELETE CASCADE,
+  mapping_strength TEXT NOT NULL DEFAULT 'full'
+                 CHECK (mapping_strength IN ('full','partial','informative')),
+  rationale      TEXT,
+  CONSTRAINT uq_crosswalk UNIQUE (objective_id, ext_control_id)
+);
+
+-- ---------- ENGAGEMENT EXECUTION OF A FRAMEWORK ----------
+CREATE TABLE frame.assessment (
+  assessment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  engagement_id UUID NOT NULL REFERENCES engage.engagement(engagement_id),
+  framework_id  UUID NOT NULL REFERENCES frame.framework(framework_id),
+  assessment_number TEXT NOT NULL UNIQUE,
+  period_start  DATE NOT NULL,
+  period_end    DATE NOT NULL,
+  as_of_date    DATE NOT NULL DEFAULT CURRENT_DATE,
+  status        TEXT NOT NULL DEFAULT 'planning'
+                CHECK (status IN ('planning','fieldwork','review','draft_report',
+                                  'client_review','final','archived')),
+  overall_rating frame.exam_rating,
+  maturity_score NUMERIC(3,2) CHECK (maturity_score BETWEEN 0 AND 5),
+  lead_assessor UUID REFERENCES core.app_user(user_id),
+  qa_reviewer   UUID REFERENCES core.app_user(user_id),
+  issued_at     TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_period CHECK (period_end >= period_start),
+  CONSTRAINT ck_qa_independent CHECK (qa_reviewer IS NULL OR qa_reviewer <> lead_assessor)
+);
+
+CREATE TABLE frame.workpaper (
+  workpaper_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  assessment_id UUID NOT NULL REFERENCES frame.assessment(assessment_id) ON DELETE CASCADE,
+  procedure_id  UUID NOT NULL REFERENCES frame.test_procedure(procedure_id),
+  wp_reference  TEXT NOT NULL,     -- 'GRC-A.GO.01.WP1'
+  population_size INT,
+  sample_size   INT,
+  sample_method TEXT CHECK (sample_method IN ('random','judgmental','systematic','full_population')),
+  work_performed TEXT,
+  result        frame.exam_rating,
+  exceptions_noted INT NOT NULL DEFAULT 0,
+  conclusion    TEXT,
+  prepared_by   UUID REFERENCES core.app_user(user_id),
+  prepared_at   TIMESTAMPTZ,
+  reviewed_by   UUID REFERENCES core.app_user(user_id),
+  reviewed_at   TIMESTAMPTZ,
+  is_locked     BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_wp_ref UNIQUE (assessment_id, wp_reference),
+  CONSTRAINT ck_wp_review CHECK (reviewed_by IS NULL OR reviewed_by <> prepared_by),
+  CONSTRAINT ck_sample CHECK (sample_size IS NULL OR population_size IS NULL
+                              OR sample_size <= population_size)
+);
+
+-- ICAEF™ "Evidence Before Conclusion" — evidence is a first-class object
+CREATE TABLE frame.evidence (
+  evidence_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workpaper_id  UUID NOT NULL REFERENCES frame.workpaper(workpaper_id) ON DELETE CASCADE,
+  document_id   UUID,              -- FK added after docs schema
+  evidence_ref  TEXT NOT NULL,
+  description   TEXT NOT NULL,
+  tier          frame.evidence_tier NOT NULL,
+  source        TEXT NOT NULL CHECK (source IN
+                ('client_provided','independently_obtained','system_generated',
+                 'third_party_confirmed','observed')),
+  obtained_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  obtained_by   UUID REFERENCES core.app_user(user_id),
+  sha256_hash   TEXT,
+  is_sufficient BOOLEAN,
+  reliability_notes TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_evidence_wp ON frame.evidence (workpaper_id, tier);
+
+-- Enforce: cannot conclude without evidence
+CREATE OR REPLACE FUNCTION frame.fn_require_evidence()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_count INT; v_min frame.evidence_tier;
+BEGIN
+  IF NEW.result IS NOT NULL AND (OLD.result IS NULL OR OLD.result <> NEW.result) THEN
+    SELECT tp.min_evidence_tier INTO v_min
+      FROM frame.test_procedure tp WHERE tp.procedure_id = NEW.procedure_id;
+
+    SELECT count(*) INTO v_count FROM frame.evidence e
+     WHERE e.workpaper_id = NEW.workpaper_id
+       AND e.is_sufficient IS TRUE
+       AND e.tier <= v_min;   -- enum ordinal: tier_i strongest
+
+    IF v_count = 0 THEN
+      RAISE EXCEPTION
+        'ICAEF violation: workpaper % cannot record a conclusion without at least one sufficient % or stronger evidence item',
+        NEW.wp_reference, v_min;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_require_evidence
+  BEFORE UPDATE ON frame.workpaper
+  FOR EACH ROW EXECUTE FUNCTION frame.fn_require_evidence();
+
+CREATE TABLE frame.finding (
+  finding_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  assessment_id UUID NOT NULL REFERENCES frame.assessment(assessment_id) ON DELETE CASCADE,
+  workpaper_id  UUID REFERENCES frame.workpaper(workpaper_id),
+  objective_id  UUID REFERENCES frame.control_objective(objective_id),
+  finding_number TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  condition     TEXT NOT NULL,   -- what is
+  criteria      TEXT NOT NULL,   -- what should be
+  cause         TEXT,
+  effect        TEXT,
+  recommendation TEXT NOT NULL,
+  severity      core.risk_rating NOT NULL,
+  rating        frame.exam_rating NOT NULL,
+  mgmt_response TEXT,
+  mgmt_owner    TEXT,
+  target_remediation_date DATE,
+  status        TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('draft','open','in_remediation','remediated',
+                                  'validated','accepted_risk','closed')),
+  validated_by  UUID REFERENCES core.app_user(user_id),
+  validated_at  TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_finding_num UNIQUE (assessment_id, finding_number)
+);
+CREATE INDEX ix_finding_open ON frame.finding (status, target_remediation_date)
+  WHERE status IN ('open','in_remediation');
+
+CREATE TABLE frame.remediation_action (
+  action_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  finding_id    UUID NOT NULL REFERENCES frame.finding(finding_id) ON DELETE CASCADE,
+  action_text   TEXT NOT NULL,
+  action_type   TEXT CHECK (action_type IN ('quick_win','strategic','policy','technical','training')),
+  owner_name    TEXT,
+  owner_user_id UUID REFERENCES core.app_user(user_id),
+  due_date      DATE,
+  completed_at  TIMESTAMPTZ,
+  evidence_of_completion TEXT,
+  status        TEXT NOT NULL DEFAULT 'planned'
+                CHECK (status IN ('planned','in_progress','complete','overdue','cancelled')),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- Maturity scoring per domain
+CREATE TABLE frame.maturity_score (
+  score_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  assessment_id UUID NOT NULL REFERENCES frame.assessment(assessment_id) ON DELETE CASCADE,
+  domain_id     UUID NOT NULL REFERENCES frame.domain(domain_id),
+  current_level NUMERIC(3,2) NOT NULL CHECK (current_level BETWEEN 0 AND 5),
+  target_level  NUMERIC(3,2) CHECK (target_level BETWEEN 0 AND 5),
+  rationale     TEXT,
+  scored_by     UUID REFERENCES core.app_user(user_id),
+  scored_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_maturity UNIQUE (assessment_id, domain_id)
+);
+
+-- ---------- TRM™ TREASURY ----------
+CREATE TABLE frame.treasury_control_register (
+  tcr_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  control_area  TEXT NOT NULL CHECK (control_area IN
+                ('treasury_governance','liquidity_governance','transaction_governance',
+                 'banking_relationship','fraud_prevention')),
+  control_name  TEXT NOT NULL,
+  control_description TEXT,
+  control_owner TEXT,
+  frequency     TEXT CHECK (frequency IN ('continuous','daily','weekly','monthly','quarterly','annual')),
+  is_automated  BOOLEAN NOT NULL DEFAULT false,
+  last_tested_at DATE,
+  last_result   frame.exam_rating,
+  next_test_due DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_tcr_due ON frame.treasury_control_register (next_test_due)
+  WHERE record_status = 'active';
+
+CREATE TABLE frame.banking_relationship (
+  relationship_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id) ON DELETE CASCADE,
+  institution_name TEXT NOT NULL,
+  relationship_type TEXT CHECK (relationship_type IN
+                    ('operating','credit','investment','custody','merchant')),
+  primary_contact TEXT,
+  services      TEXT[],
+  annual_fees   NUMERIC(12,2),
+  review_frequency_months INT DEFAULT 12,
+  last_review_date DATE,
+  next_review_due DATE,
+  concentration_pct NUMERIC(5,2),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- ---------- TRUSTFABRIC™ — "No Proof, No Payment" ----------
+CREATE TABLE frame.trust_identity (
+  trust_identity_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID REFERENCES crm.client(client_id),
+  subject_name  TEXT NOT NULL,
+  subject_email CITEXT,
+  identity_assurance_level TEXT NOT NULL CHECK (identity_assurance_level IN
+                ('IAL1','IAL2','IAL3')),
+  authenticator_level TEXT CHECK (authenticator_level IN ('AAL1','AAL2','AAL3')),
+  verified_at   TIMESTAMPTZ,
+  verified_by   UUID REFERENCES core.app_user(user_id),
+  verification_method TEXT,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE frame.certificate (
+  certificate_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  trust_identity_id UUID REFERENCES frame.trust_identity(trust_identity_id),
+  client_id     UUID REFERENCES crm.client(client_id),
+  ca_provider   TEXT NOT NULL DEFAULT 'GlobalSign',
+  cert_type     TEXT NOT NULL CHECK (cert_type IN ('AATL','EV','OV','DV','MSSL','SMIME','CODE_SIGN')),
+  serial_number TEXT NOT NULL,
+  subject_dn    TEXT NOT NULL,
+  issuer_dn     TEXT,
+  thumbprint_sha256 TEXT NOT NULL UNIQUE,
+  issued_at     TIMESTAMPTZ NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  revoked_at    TIMESTAMPTZ,
+  revocation_reason TEXT,
+  status        TEXT GENERATED ALWAYS AS (
+                  CASE WHEN revoked_at IS NOT NULL THEN 'revoked'
+                       WHEN expires_at < now() THEN 'expired'
+                       ELSE 'valid' END) STORED,
+  ra_operator   UUID REFERENCES core.app_user(user_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_cert_dates CHECK (expires_at > issued_at)
+);
+CREATE INDEX ix_cert_expiry ON frame.certificate (expires_at)
+  WHERE revoked_at IS NULL;
+
+CREATE TABLE frame.authority_grant (
+  grant_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id),
+  trust_identity_id UUID NOT NULL REFERENCES frame.trust_identity(trust_identity_id),
+  authority_type TEXT NOT NULL CHECK (authority_type IN
+                ('payment_initiate','payment_approve','account_open','contract_sign',
+                 'wire_release','vendor_add','user_admin')),
+  limit_amount  NUMERIC(14,2),
+  currency_code CHAR(3) DEFAULT 'USD',
+  effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+  effective_to   DATE,
+  granted_by_document_id UUID,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE frame.transaction_attestation (
+  attestation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id),
+  grant_id      UUID REFERENCES frame.authority_grant(grant_id),
+  certificate_id UUID REFERENCES frame.certificate(certificate_id),
+  transaction_ref TEXT NOT NULL,
+  transaction_type TEXT NOT NULL,
+  amount        NUMERIC(14,2),
+  currency_code CHAR(3) DEFAULT 'USD',
+  counterparty  TEXT,
+  payload_hash  TEXT NOT NULL,
+  signature_b64 TEXT NOT NULL,
+  signed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  verification_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (verification_status IN ('pending','verified','failed','revoked_signer')),
+  verified_at   TIMESTAMPTZ,
+  device_attestation JSONB,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_attest_tx ON frame.transaction_attestation (transaction_ref);
+
+-- "No Proof, No Payment" enforcement
+CREATE OR REPLACE FUNCTION frame.fn_no_proof_no_payment()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_valid BOOLEAN; v_limit NUMERIC;
+BEGIN
+  SELECT (c.status = 'valid'), g.limit_amount
+    INTO v_valid, v_limit
+    FROM frame.authority_grant g
+    LEFT JOIN frame.certificate c ON c.certificate_id = NEW.certificate_id
+   WHERE g.grant_id = NEW.grant_id
+     AND CURRENT_DATE BETWEEN g.effective_from AND COALESCE(g.effective_to, '9999-12-31');
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'TrustFabric: no active authority grant for transaction %', NEW.transaction_ref;
+  END IF;
+  IF v_valid IS NOT TRUE THEN
+    RAISE EXCEPTION 'TrustFabric: signing certificate is not valid for transaction %', NEW.transaction_ref;
+  END IF;
+  IF v_limit IS NOT NULL AND NEW.amount > v_limit THEN
+    RAISE EXCEPTION 'TrustFabric: amount % exceeds authority limit % for transaction %',
+      NEW.amount, v_limit, NEW.transaction_ref;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_no_proof_no_payment
+  BEFORE INSERT ON frame.transaction_attestation
+  FOR EACH ROW EXECUTE FUNCTION frame.fn_no_proof_no_payment();
+```
+
+---
+
+## SECTION 8: DOCS — DOCUMENT CENTER
+
+```sql
+-- ============================================================
+-- 06_DOCS
+-- ============================================================
+
+CREATE TABLE docs.retention_policy (
+  policy_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  policy_code   TEXT NOT NULL UNIQUE,
+  policy_name   TEXT NOT NULL,
+  retention_years INT NOT NULL,
+  trigger_event TEXT NOT NULL CHECK (trigger_event IN
+                ('creation','engagement_close','relationship_end','fiscal_year_end')),
+  disposition   TEXT NOT NULL CHECK (disposition IN ('destroy','archive','review')),
+  legal_basis   TEXT,          -- 'BSA 31 CFR 1010.430 - 5 years'
+  is_active     BOOLEAN NOT NULL DEFAULT true
+);
+
+CREATE TABLE docs.document (
+  document_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_id     UUID REFERENCES crm.client(client_id),
+  engagement_id UUID REFERENCES engage.engagement(engagement_id),
+  case_id       UUID REFERENCES engage.case(case_id),
+  kyc_case_id   UUID REFERENCES intake.kyc_case(kyc_case_id),
+  doc_number    TEXT NOT NULL UNIQUE,
+  title         TEXT NOT NULL,
+  doc_type      TEXT NOT NULL CHECK (doc_type IN
+                ('policy','procedure','contract','engagement_letter','report',
+                 'workpaper','evidence','identification','financial_statement',
+                 'bank_statement','certificate','correspondence','deliverable','other')),
+  classification TEXT NOT NULL DEFAULT 'confidential'
+                CHECK (classification IN ('public','internal','confidential','restricted','privileged')),
+  retention_policy_id UUID REFERENCES docs.retention_policy(policy_id),
+  legal_hold    BOOLEAN NOT NULL DEFAULT false,
+  legal_hold_reason TEXT,
+  eligible_for_disposition_on DATE,
+  current_version INT NOT NULL DEFAULT 1,
+  owner_id      UUID REFERENCES core.app_user(user_id),
+  tags          TEXT[],
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_doc_client ON docs.document (client_id, doc_type);
+CREATE INDEX ix_doc_disposition ON docs.document (eligible_for_disposition_on)
+  WHERE legal_hold = false AND record_status = 'active';
+CREATE INDEX ix_doc_tags ON docs.document USING gin (tags);
+
+CREATE TABLE docs.document_version (
+  version_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id   UUID NOT NULL REFERENCES docs.document(document_id) ON DELETE CASCADE,
+  version_no    INT NOT NULL,
+  storage_backend TEXT NOT NULL DEFAULT 's3',
+  storage_bucket TEXT NOT NULL,
+  storage_key   TEXT NOT NULL,
+  filename      TEXT NOT NULL,
+  mime_type     TEXT,
+  byte_size     BIGINT,
+  sha256_hash   TEXT NOT NULL,
+  is_encrypted  BOOLEAN NOT NULL DEFAULT true,
+  kms_key_ref   TEXT,
+  virus_scan_status TEXT DEFAULT 'pending'
+                CHECK (virus_scan_status IN ('pending','clean','infected','error')),
+  virus_scanned_at TIMESTAMPTZ,
+  change_note   TEXT,
+  uploaded_by   UUID REFERENCES core.app_user(user_id),
+  uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_doc_version UNIQUE (document_id, version_no)
+);
+CREATE INDEX ix_docver_hash ON docs.document_version (sha256_hash);
+
+CREATE TABLE docs.document_access_log (
+  access_id   BIGSERIAL PRIMARY KEY,
+  document_id UUID NOT NULL REFERENCES docs.document(document_id) ON DELETE CASCADE,
+  version_id  UUID REFERENCES docs.document_version(version_id),
+  user_id     UUID REFERENCES core.app_user(user_id),
+  action      TEXT NOT NULL CHECK (action IN ('view','download','print','share','delete','restore')),
+  ip_address  INET,
+  user_agent  TEXT,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_docaccess ON docs.document_access_log (document_id, occurred_at DESC);
+
+CREATE TABLE docs.esign_envelope (
+  envelope_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id   UUID NOT NULL REFERENCES docs.document(document_id),
+  provider      TEXT NOT NULL DEFAULT 'globalsign',
+  external_ref  TEXT,
+  status        TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft','sent','partially_signed','completed','declined','voided','expired')),
+  sent_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, expires_at TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE docs.esign_signer (
+  signer_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  envelope_id UUID NOT NULL REFERENCES docs.esign_envelope(envelope_id) ON DELETE CASCADE,
+  contact_id  UUID REFERENCES crm.contact(contact_id),
+  certificate_id UUID REFERENCES frame.certificate(certificate_id),
+  signer_name TEXT NOT NULL,
+  signer_email CITEXT NOT NULL,
+  routing_order INT NOT NULL DEFAULT 1,
+  status      TEXT NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending','sent','viewed','signed','declined')),
+  signed_at   TIMESTAMPTZ,
+  signature_hash TEXT,
+  ip_address  INET
+);
+
+-- Now wire evidence -> document
+ALTER TABLE frame.evidence
+  ADD CONSTRAINT fk_evidence_document
+  FOREIGN KEY (document_id) REFERENCES docs.document(document_id);
+```
+
+---
+
+## SECTION 9: PORTAL, KB, GOV
+
+```sql
+-- ============================================================
+-- 07_PORTAL
+-- ============================================================
+
+CREATE TABLE portal.request (
+  request_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  client_id     UUID NOT NULL REFERENCES crm.client(client_id),
+  engagement_id UUID REFERENCES engage.engagement(engagement_id),
+  assessment_id UUID REFERENCES frame.assessment(assessment_id),
+  request_number TEXT NOT NULL UNIQUE,   -- PBC list item
+  title         TEXT NOT NULL,
+  description   TEXT,
+  request_type  TEXT NOT NULL DEFAULT 'document'
+                CHECK (request_type IN ('document','information','meeting','signature','approval')),
+  requested_from UUID REFERENCES crm.contact(contact_id),
+  due_date      DATE,
+  status        TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open','submitted','under_review','accepted','rejected','withdrawn')),
+  responded_at  TIMESTAMPTZ,
+  reminder_count INT NOT NULL DEFAULT 0,
+  last_reminder_at TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_req_due ON portal.request (due_date, status) WHERE status = 'open';
+
+CREATE TABLE portal.request_document (
+  request_id  UUID NOT NULL REFERENCES portal.request(request_id) ON DELETE CASCADE,
+  document_id UUID NOT NULL REFERENCES docs.document(document_id) ON DELETE CASCADE,
+  PRIMARY KEY (request_id, document_id)
+);
+
+CREATE TABLE portal.share_link (
+  share_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id UUID REFERENCES docs.document(document_id) ON DELETE CASCADE,
+  token_hash  TEXT NOT NULL UNIQUE,
+  created_for_contact UUID REFERENCES crm.contact(contact_id),
+  max_downloads INT,
+  download_count INT NOT NULL DEFAULT 0,
+  requires_otp BOOLEAN NOT NULL DEFAULT true,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  revoked_at  TIMESTAMPTZ,
+  created_by  UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_share_expiry ON portal.share_link (expires_at) WHERE revoked_at IS NULL;
+
+CREATE TABLE portal.message (
+  message_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id   UUID NOT NULL REFERENCES crm.client(client_id),
+  engagement_id UUID REFERENCES engage.engagement(engagement_id),
+  thread_id   UUID NOT NULL,
+  parent_message_id UUID REFERENCES portal.message(message_id),
+  sender_user_id UUID REFERENCES core.app_user(user_id),
+  subject     TEXT,
+  body        TEXT NOT NULL,
+  is_internal_only BOOLEAN NOT NULL DEFAULT false,
+  read_at     TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- 08_KB  (Knowledge Base + R&D + RAG)
+-- ============================================================
+
+CREATE TABLE kb.space (
+  space_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  space_code TEXT NOT NULL UNIQUE,
+  name       TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'internal'
+             CHECK (visibility IN ('public','client','internal','restricted'))
+);
+
+CREATE TABLE kb.article (
+  article_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  space_id    UUID NOT NULL REFERENCES kb.space(space_id),
+  slug        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body_md     TEXT NOT NULL,
+  summary     TEXT,
+  article_type TEXT CHECK (article_type IN
+              ('guidance','procedure','faq','regulatory_alert','research','template','playbook')),
+  framework_id UUID REFERENCES frame.framework(framework_id),
+  tags        TEXT[],
+  status      TEXT NOT NULL DEFAULT 'draft'
+              CHECK (status IN ('draft','review','published','deprecated')),
+  author_id   UUID REFERENCES core.app_user(user_id),
+  approver_id UUID REFERENCES core.app_user(user_id),
+  published_at TIMESTAMPTZ,
+  review_due  DATE,
+  view_count  INT NOT NULL DEFAULT 0,
+  search_tsv  TSVECTOR GENERATED ALWAYS AS (
+                to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body_md,''))) STORED,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_kb_slug UNIQUE (space_id, slug)
+);
+CREATE INDEX ix_kb_search ON kb.article USING gin (search_tsv);
+CREATE INDEX ix_kb_tags ON kb.article USING gin (tags);
+
+-- RAG chunks
+CREATE TABLE kb.chunk (
+  chunk_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  article_id  UUID REFERENCES kb.article(article_id) ON DELETE CASCADE,
+  document_id UUID REFERENCES docs.document(document_id) ON DELETE CASCADE,
+  chunk_index INT NOT NULL,
+  content     TEXT NOT NULL,
+  token_count INT,
+  embedding   VECTOR(1536),
+  metadata    JSONB DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT ck_chunk_source CHECK (num_nonnulls(article_id, document_id) = 1)
+);
+CREATE INDEX ix_chunk_vec ON kb.chunk
+  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+CREATE TABLE kb.rnd_item (
+  rnd_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title       TEXT NOT NULL,
+  hypothesis  TEXT,
+  category    TEXT CHECK (category IN
+              ('framework','technology','regulatory','service_line','tooling')),
+  status      TEXT NOT NULL DEFAULT 'idea'
+              CHECK (status IN ('idea','researching','piloting','adopted','parked','rejected')),
+  impact_score INT CHECK (impact_score BETWEEN 1 AND 5),
+  effort_score INT CHECK (effort_score BETWEEN 1 AND 5),
+  priority    NUMERIC(4,2) GENERATED ALWAYS AS
+              (impact_score::numeric / NULLIF(effort_score,0)) STORED,
+  owner_id    UUID REFERENCES core.app_user(user_id),
+  findings    TEXT,
+  decision    TEXT,
+  decided_at  TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE kb.recommendation (
+  recommendation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id   UUID REFERENCES crm.client(client_id),
+  assessment_id UUID REFERENCES frame.assessment(assessment_id),
+  finding_id  UUID REFERENCES frame.finding(finding_id),
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  category    TEXT CHECK (category IN ('quick_win','strategic','policy','technical','training')),
+  effort      TEXT CHECK (effort IN ('low','medium','high')),
+  impact      TEXT CHECK (impact IN ('low','medium','high')),
+  sequence_no INT,
+  status      TEXT NOT NULL DEFAULT 'proposed'
+              CHECK (status IN ('proposed','accepted','declined','implemented')),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- ============================================================
+-- 09_GOV  (Internal governance — In.Tune governing itself)
+-- ============================================================
+
+CREATE TABLE gov.policy (
+  policy_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  policy_code  TEXT NOT NULL,
+  version      INT NOT NULL DEFAULT 1,
+  title        TEXT NOT NULL,
+  policy_type  TEXT NOT NULL CHECK (policy_type IN
+               ('policy','standard','procedure','guideline','charter')),
+  domain       TEXT,
+  body_md      TEXT NOT NULL,
+  owner_id     UUID REFERENCES core.app_user(user_id),
+  approver_id  UUID REFERENCES core.app_user(user_id),
+  status       TEXT NOT NULL DEFAULT 'draft'
+               CHECK (status IN ('draft','review','approved','published','retired')),
+  effective_date DATE,
+  review_frequency_months INT NOT NULL DEFAULT 12,
+  next_review_due DATE,
+  document_id  UUID REFERENCES docs.document(document_id),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_policy_ver UNIQUE (policy_code, version),
+  CONSTRAINT ck_policy_approver CHECK (approver_id IS NULL OR approver_id <> owner_id)
+);
+CREATE INDEX ix_policy_review ON gov.policy (next_review_due)
+  WHERE status = 'published';
+
+CREATE TABLE gov.policy_attestation (
+  attestation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  policy_id   UUID NOT NULL REFERENCES gov.policy(policy_id) ON DELETE CASCADE,
+  user_id     UUID NOT NULL REFERENCES core.app_user(user_id),
+  attested_at TIMESTAMPTZ,
+  due_at      TIMESTAMPTZ NOT NULL,
+  ip_address  INET,
+  CONSTRAINT uq_attest UNIQUE (policy_id, user_id)
+);
+
+CREATE TABLE gov.control (
+  control_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  control_code TEXT NOT NULL UNIQUE,
+  control_name TEXT NOT NULL,
+  description  TEXT,
+  control_type TEXT CHECK (control_type IN ('preventive','detective','corrective','directive')),
+  frequency    TEXT CHECK (frequency IN ('continuous','daily','weekly','monthly','quarterly','annual','event_driven')),
+  is_key_control BOOLEAN NOT NULL DEFAULT false,
+  is_automated BOOLEAN NOT NULL DEFAULT false,
+  owner_id     UUID REFERENCES core.app_user(user_id),
+  policy_id    UUID REFERENCES gov.policy(policy_id),
+  last_tested  DATE,
+  last_result  frame.exam_rating,
+  next_test_due DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE gov.risk (
+  risk_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  risk_code    TEXT NOT NULL UNIQUE,
+  title        TEXT NOT NULL,
+  description  TEXT,
+  category     TEXT CHECK (category IN
+               ('strategic','operational','financial','compliance','technology','reputational','third_party')),
+  inherent_likelihood INT CHECK (inherent_likelihood BETWEEN 1 AND 5),
+  inherent_impact     INT CHECK (inherent_impact BETWEEN 1 AND 5),
+  inherent_score INT GENERATED ALWAYS AS (inherent_likelihood * inherent_impact) STORED,
+  residual_likelihood INT CHECK (residual_likelihood BETWEEN 1 AND 5),
+  residual_impact     INT CHECK (residual_impact BETWEEN 1 AND 5),
+  residual_score INT GENERATED ALWAYS AS (residual_likelihood * residual_impact) STORED,
+  treatment    TEXT CHECK (treatment IN ('accept','mitigate','transfer','avoid')),
+  owner_id     UUID REFERENCES core.app_user(user_id),
+  last_reviewed DATE,
+  next_review_due DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE gov.risk_control (
+  risk_id    UUID NOT NULL REFERENCES gov.risk(risk_id) ON DELETE CASCADE,
+  control_id UUID NOT NULL REFERENCES gov.control(control_id) ON DELETE CASCADE,
+  PRIMARY KEY (risk_id, control_id)
+);
+
+CREATE TABLE gov.vendor (
+  vendor_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  vendor_name  TEXT NOT NULL,
+  service_description TEXT,
+  criticality  core.risk_rating NOT NULL DEFAULT 'moderate',
+  has_data_access BOOLEAN NOT NULL DEFAULT false,
+  data_classification TEXT,
+  soc2_on_file BOOLEAN NOT NULL DEFAULT false,
+  soc2_expires DATE,
+  contract_end DATE,
+  last_review_date DATE,
+  next_review_due DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+```
+
+---
+
+## SECTION 10: ROW LEVEL SECURITY
+
+```sql
+-- ============================================================
+-- 10_RLS
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION core.fn_has_perm(p_perm TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM core.user_role ur
+    JOIN core.role_permission rp ON rp.role_id = ur.role_id
+    JOIN core.permission p ON p.permission_id = rp.permission_id
+    WHERE ur.user_id = core.current_actor()
+      AND (ur.expires_at IS NULL OR ur.expires_at > now())
+      AND p.perm_code = p_perm);
+$$;
+
+CREATE OR REPLACE FUNCTION core.fn_is_staff()
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER AS $$
+  SELECT COALESCE((SELECT is_staff FROM core.app_user
+                    WHERE user_id = core.current_actor()), false);
+$$;
+
+-- Clients a portal user may see
+CREATE OR REPLACE FUNCTION core.fn_visible_clients()
+RETURNS SETOF UUID LANGUAGE sql STABLE SECURITY DEFINER AS $$
+  SELECT c.client_id FROM crm.contact c
+   WHERE c.portal_user_id = core.current_actor()
+     AND c.record_status = 'active';
+$$;
+
+ALTER TABLE crm.client ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_client_staff ON crm.client
+  USING (core.fn_is_staff() AND tenant_id = core.current_tenant());
+CREATE POLICY p_client_portal ON crm.client FOR SELECT
+  USING (client_id IN (SELECT core.fn_visible_clients()));
+
+ALTER TABLE docs.document ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_doc_staff ON docs.document
+  USING (core.fn_is_staff() AND tenant_id = core.current_tenant());
+CREATE POLICY p_doc_portal ON docs.document FOR SELECT
+  USING (client_id IN (SELECT core.fn_visible_clients())
+         AND classification NOT IN ('internal','restricted','privileged'));
+
+ALTER TABLE engage.case ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_case_staff ON engage.case
+  USING (core.fn_is_staff()
+         AND tenant_id = core.current_tenant()
+         AND (NOT is_confidential OR core.fn_has_perm('engage.case.confidential')));
+
+ALTER TABLE engage.case_note ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_note_staff ON engage.case_note
+  USING (core.fn_is_staff()
+         AND (NOT is_privileged OR core.fn_has_perm('engage.note.privileged')));
+
+ALTER TABLE intake.kyc_case ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_kyc_staff ON intake.kyc_case
+  USING (core.fn_is_staff() AND tenant_id = core.current_tenant()
+         AND core.fn_has_perm('intake.kyc.read'));
+
+ALTER TABLE intake.sar_case ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_sar_restricted ON intake.sar_case
+  USING (core.fn_has_perm('intake.sar.read'));   -- SAR confidentiality: 31 CFR 1020.320(e)
+
+ALTER TABLE portal.request ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_req_staff ON portal.request
+  USING (core.fn_is_staff() AND tenant_id = core.current_tenant());
+CREATE POLICY p_req_portal ON portal.request
+  USING (client_id IN (SELECT core.fn_visible_clients()));
+```
+
+---
+
+## SECTION 11: REPORTING VIEWS
+
+```sql
+-- ============================================================
+-- 11_RPT
+-- ============================================================
+
+CREATE MATERIALIZED VIEW rpt.mv_client_360 AS
+SELECT
+  c.client_id, c.client_number, c.legal_name, c.risk_rating, c.is_regulated,
+  k.status            AS kyc_status,
+  k.next_review_due   AS kyc_next_review,
+  count(DISTINCT e.engagement_id) FILTER (WHERE e.status = 'active') AS active_engagements,
+  count(DISTINCT f.finding_id)   FILTER (WHERE f.status IN ('open','in_remediation')) AS open_findings,
+  count(DISTINCT f.finding_id)   FILTER (WHERE f.severity IN ('high','critical')
+                                          AND f.status IN ('open','in_remediation')) AS high_findings,
+  count(DISTINCT d.document_id)  AS document_count,
+  max(a.as_of_date)   AS last_assessment_date,
+  sum(e.contract_value) FILTER (WHERE e.status = 'active') AS active_contract_value
+FROM crm.client c
+LEFT JOIN LATERAL (
+  SELECT * FROM intake.kyc_case kk
+   WHERE kk.client_id = c.client_id AND kk.record_status = 'active'
+   ORDER BY kk.opened_at DESC LIMIT 1) k ON true
+LEFT JOIN engage.engagement e ON e.client_id = c.client_id
+LEFT JOIN frame.assessment a  ON a.engagement_id = e.engagement_id
+LEFT JOIN frame.finding f     ON f.assessment_id = a.assessment_id
+LEFT JOIN docs.document d     ON d.client_id = c.client_id
+WHERE c.record_status = 'active'
+GROUP BY c.client_id, c.client_number, c.legal_name, c.risk_rating,
+         c.is_regulated, k.status, k.next_review_due;
+
+CREATE UNIQUE INDEX ix_mv_client360 ON rpt.mv_client_360 (client_id);
+
+CREATE MATERIALIZED VIEW rpt.mv_compliance_calendar AS
+SELECT 'kyc_review' AS obligation_type, kyc_case_id AS source_id,
+       client_id, next_review_due AS due_date,
+       'KYC periodic review: ' || case_number AS description,
+       CASE WHEN risk_rating IN ('high','critical') THEN 'high' ELSE 'normal' END AS urgency
+  FROM intake.kyc_case
+ WHERE record_status = 'active' AND next_review_due IS NOT NULL
+UNION ALL
+SELECT 'policy_review', policy_id, NULL, next_review_due,
+       'Policy review: ' || title, 'normal'
+  FROM gov.policy WHERE status = 'published' AND next_review_due IS NOT NULL
+UNION ALL
+SELECT 'control_test', control_id, NULL, next_test_due,
+       'Control test: ' || control_name,
+       CASE WHEN is_key_control THEN 'high' ELSE 'normal' END
+  FROM gov.control WHERE record_status = 'active' AND next_test_due IS NOT NULL
+UNION ALL
+SELECT 'cert_expiry', certificate_id, client_id, expires_at::date,
+       'Certificate expiring: ' || subject_dn, 'high'
+  FROM frame.certificate WHERE revoked_at IS NULL
+UNION ALL
+SELECT 'finding_remediation', finding_id, NULL, target_remediation_date,
+       'Finding remediation: ' || title,
+       CASE WHEN severity IN ('high','critical') THEN 'high' ELSE 'normal' END
+  FROM frame.finding WHERE status IN ('open','in_remediation')
+UNION ALL
+SELECT 'sar_filing', sar_id, client_id, filing_due_at::date,
+       'SAR filing deadline: ' || sar_number, 'high'
+  FROM intake.sar_case WHERE status IN ('open','investigating')
+UNION ALL
+SELECT 'doc_disposition', document_id, client_id, eligible_for_disposition_on,
+       'Retention disposition: ' || title, 'normal'
+  FROM docs.document
+ WHERE legal_hold = false AND record_status = 'active'
+   AND eligible_for_disposition_on IS NOT NULL;
+
+CREATE INDEX ix_mv_cal_due ON rpt.mv_compliance_calendar (due_date, urgency);
+
+CREATE MATERIALIZED VIEW rpt.mv_engagement_economics AS
+SELECT e.engagement_id, e.engagement_number, e.title, c.legal_name,
+       e.contract_value, e.fee_type, e.status,
+       COALESCE(sum(t.hours) FILTER (WHERE t.billable), 0)     AS billable_hours,
+       COALESCE(sum(t.hours) FILTER (WHERE NOT t.billable), 0) AS nonbillable_hours,
+       COALESCE(sum(t.hours * t.rate) FILTER (WHERE t.billable), 0) AS wip_value,
+       CASE WHEN e.contract_value > 0
+            THEN round(COALESCE(sum(t.hours * t.rate) FILTER (WHERE t.billable),0)
+                       / e.contract_value * 100, 2) END        AS pct_budget_consumed
+FROM engage.engagement e
+JOIN crm.client c ON c.client_id = e.client_id
+LEFT JOIN engage.project p ON p.engagement_id = e.engagement_id
+LEFT JOIN engage.time_entry t ON t.project_id = p.project_id AND t.record_status = 'active'
+WHERE e.record_status = 'active'
+GROUP BY e.engagement_id, e.engagement_number, e.title, c.legal_name,
+         e.contract_value, e.fee_type, e.status;
+
+CREATE UNIQUE INDEX ix_mv_econ ON rpt.mv_engagement_economics (engagement_id);
+
+-- Compliance traceability matrix (REG-C™ output)
+CREATE VIEW rpt.v_traceability_matrix AS
+SELECT fw.framework_code, d.domain_name, co.objective_code, co.statement,
+       s.standard_code, ec.control_ref, cw.mapping_strength,
+       count(DISTINCT wp.workpaper_id) AS times_tested,
+       max(wp.reviewed_at)             AS last_tested
+FROM frame.framework fw
+JOIN frame.domain d            ON d.framework_id = fw.framework_id
+JOIN frame.control_objective co ON co.domain_id = d.domain_id
+LEFT JOIN frame.crosswalk cw   ON cw.objective_id = co.objective_id
+LEFT JOIN frame.external_control ec ON ec.ext_control_id = cw.ext_control_id
+LEFT JOIN frame.external_standard s ON s.standard_id = ec.standard_id
+LEFT JOIN frame.test_procedure tp ON tp.objective_id = co.objective_id
+LEFT JOIN frame.workpaper wp   ON wp.procedure_id = tp.procedure_id
+GROUP BY fw.framework_code, d.domain_name, co.objective_code, co.statement,
+         s.standard_code, ec.control_ref, cw.mapping_strength;
+```
+
+---
+
+## SECTION 12: CRON JOBS
+
+```sql
+-- ============================================================
+-- 12_CRON  (pg_cron)
+-- ============================================================
+
+-- ---------- JOB FUNCTIONS ----------
+
+-- 1. KYC periodic review scheduler (risk-based cadence)
+CREATE OR REPLACE FUNCTION core.job_kyc_review_scheduler()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0; r RECORD;
+BEGIN
+  FOR r IN
+    SELECT k.kyc_case_id, k.client_id, k.tenant_id, k.risk_rating, k.assigned_to
+      FROM intake.kyc_case k
+     WHERE k.record_status = 'active'
+       AND k.status = 'approved'
+       AND k.next_review_due <= CURRENT_DATE + 30
+       AND NOT EXISTS (SELECT 1 FROM intake.kyc_case k2
+                        WHERE k2.client_id = k.client_id
+                          AND k2.case_type = 'periodic_review'
+                          AND k2.status IN ('not_started','in_progress','pending_review'))
+  LOOP
+    INSERT INTO intake.kyc_case (
+      tenant_id, client_id, case_number, case_type, status,
+      risk_rating, assigned_to, next_review_due)
+    VALUES (r.tenant_id, r.client_id,
+      'KYC-' || to_char(now(),'YYYY') || '-' || lpad(nextval('intake.seq_kyc')::text,6,'0'),
+      'periodic_review', 'not_started', r.risk_rating, r.assigned_to,
+      CURRENT_DATE + CASE r.risk_rating
+        WHEN 'critical' THEN 90 WHEN 'high' THEN 180
+        WHEN 'elevated' THEN 365 ELSE 1095 END);
+
+    INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+    VALUES (r.tenant_id, r.assigned_to, 'email',
+      'KYC periodic review due',
+      'A periodic review has been opened for client ' || r.client_id,
+      jsonb_build_object('kyc_case_id', r.kyc_case_id, 'client_id', r.client_id));
+
+    v_count := v_count + 1;
+  END LOOP;
+  RETURN v_count;
+END $$;
+
+CREATE SEQUENCE IF NOT EXISTS intake.seq_kyc;
+CREATE SEQUENCE IF NOT EXISTS engage.seq_case;
+CREATE SEQUENCE IF NOT EXISTS docs.seq_doc;
+
+-- 2. Certificate expiry warnings (90/60/30/14/7/1 day)
+CREATE OR REPLACE FUNCTION core.job_certificate_expiry_watch()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0; r RECORD;
+BEGIN
+  FOR r IN
+    SELECT c.certificate_id, c.subject_dn, c.expires_at, c.ra_operator, c.cert_type,
+           (c.expires_at::date - CURRENT_DATE) AS days_left,
+           cl.tenant_id
+      FROM frame.certificate c
+      LEFT JOIN crm.client cl ON cl.client_id = c.client_id
+     WHERE c.revoked_at IS NULL
+       AND (c.expires_at::date - CURRENT_DATE) IN (90,60,30,14,7,1)
+  LOOP
+    INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+    VALUES (r.tenant_id, r.ra_operator, 'email',
+      format('[%s days] Certificate expiring: %s', r.days_left, r.cert_type),
+      format('Certificate %s expires on %s.', r.subject_dn, r.expires_at::date),
+      jsonb_build_object('certificate_id', r.certificate_id, 'days_left', r.days_left));
+    v_count := v_count + 1;
+  END LOOP;
+  RETURN v_count;
+END $$;
+
+-- 3. Sanctions rescreening (risk-based)
+CREATE OR REPLACE FUNCTION core.job_queue_rescreening()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0;
+BEGIN
+  INSERT INTO intake.screening_run
+    (client_id, provider, list_type, search_term, is_automated, request_payload)
+  SELECT c.client_id, 'ofac', 'sanctions', c.legal_name, true,
+         jsonb_build_object('queued_at', now(), 'reason', 'periodic_rescreen')
+    FROM crm.client c
+   WHERE c.record_status = 'active'
+     AND NOT EXISTS (
+       SELECT 1 FROM intake.screening_run s
+        WHERE s.client_id = c.client_id
+          AND s.list_type = 'sanctions'
+          AND s.run_at > now() - CASE c.risk_rating
+                WHEN 'critical' THEN INTERVAL '1 day'
+                WHEN 'high'     THEN INTERVAL '7 days'
+                WHEN 'elevated' THEN INTERVAL '30 days'
+                ELSE INTERVAL '90 days' END);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 4. SLA breach / overdue escalation
+CREATE OR REPLACE FUNCTION core.job_sla_escalation()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0;
+BEGIN
+  -- Overdue remediation actions
+  UPDATE frame.remediation_action
+     SET status = 'overdue', updated_at = now()
+   WHERE status IN ('planned','in_progress')
+     AND due_date < CURRENT_DATE;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  -- SAR filing clock alerts
+  INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+  SELECT s.tenant_id, s.investigator, 'email',
+         'SAR filing deadline approaching: ' || s.sar_number,
+         format('SAR %s must be filed by %s.', s.sar_number, s.filing_due_at::date),
+         jsonb_build_object('sar_id', s.sar_id)
+    FROM intake.sar_case s
+   WHERE s.status IN ('open','investigating')
+     AND s.filing_due_at BETWEEN now() AND now() + INTERVAL '5 days';
+
+  -- Case SLA breach
+  INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+  SELECT c.tenant_id, c.owner_id, 'in_app',
+         'Case SLA breached: ' || c.case_number,
+         c.title, jsonb_build_object('case_id', c.case_id)
+    FROM engage.case c
+   WHERE c.status NOT IN ('resolved','closed')
+     AND c.sla_due_at < now();
+
+  RETURN v_count;
+END $$;
+
+-- 5. Retention / disposition sweep
+CREATE OR REPLACE FUNCTION core.job_retention_sweep()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0;
+BEGIN
+  -- Compute disposition dates where missing
+  UPDATE docs.document d
+     SET eligible_for_disposition_on =
+         (d.created_at::date + (rp.retention_years || ' years')::interval)::date,
+         updated_at = now()
+    FROM docs.retention_policy rp
+   WHERE rp.policy_id = d.retention_policy_id
+     AND d.eligible_for_disposition_on IS NULL
+     AND rp.trigger_event = 'creation';
+
+  -- Flag for review; NEVER auto-delete under legal hold
+  INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+  SELECT d.tenant_id, d.owner_id, 'in_app',
+         'Documents eligible for disposition',
+         format('%s is past its retention period.', d.title),
+         jsonb_build_object('document_id', d.document_id)
+    FROM docs.document d
+   WHERE d.legal_hold = false
+     AND d.record_status = 'active'
+     AND d.eligible_for_disposition_on <= CURRENT_DATE;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 6. Policy & control review scheduler
+CREATE OR REPLACE FUNCTION core.job_governance_review()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0;
+BEGIN
+  UPDATE gov.policy
+     SET next_review_due = COALESCE(effective_date, CURRENT_DATE)
+                           + (review_frequency_months || ' months')::interval
+   WHERE status = 'published' AND next_review_due IS NULL;
+
+  INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+  SELECT t.tenant_id, p.owner_id, 'email',
+         'Policy review due: ' || p.title,
+         format('Policy %s is due for review on %s.', p.policy_code, p.next_review_due),
+         jsonb_build_object('policy_id', p.policy_id)
+    FROM gov.policy p
+    CROSS JOIN LATERAL (SELECT tenant_id FROM core.tenant WHERE is_internal LIMIT 1) t
+   WHERE p.status = 'published'
+     AND p.next_review_due BETWEEN CURRENT_DATE AND CURRENT_DATE + 30;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 7. Portal request reminders (escalating)
+CREATE OR REPLACE FUNCTION core.job_portal_reminders()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT := 0;
+BEGIN
+  INSERT INTO core.notification (tenant_id, user_id, channel, subject, body, payload)
+  SELECT r.tenant_id, ct.portal_user_id, 'email',
+         'Reminder: ' || r.title,
+         format('Item %s is due %s.', r.request_number, r.due_date),
+         jsonb_build_object('request_id', r.request_id)
+    FROM portal.request r
+    JOIN crm.contact ct ON ct.contact_id = r.requested_from
+   WHERE r.status = 'open'
+     AND r.due_date IS NOT NULL
+     AND (r.last_reminder_at IS NULL OR r.last_reminder_at < now() - INTERVAL '3 days')
+     AND r.due_date <= CURRENT_DATE + 7;
+
+  UPDATE portal.request
+     SET reminder_count = reminder_count + 1, last_reminder_at = now()
+   WHERE status = 'open' AND due_date <= CURRENT_DATE + 7
+     AND (last_reminder_at IS NULL OR last_reminder_at < now() - INTERVAL '3 days');
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 8. Expired share link revocation
+CREATE OR REPLACE FUNCTION core.job_revoke_expired_shares()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT;
+BEGIN
+  UPDATE portal.share_link
+     SET revoked_at = now()
+   WHERE revoked_at IS NULL
+     AND (expires_at < now()
+          OR (max_downloads IS NOT NULL AND download_count >= max_downloads));
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 9. Audit chain integrity verification
+CREATE TABLE core.integrity_check (
+  check_id    BIGSERIAL PRIMARY KEY,
+  checked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  rows_checked BIGINT,
+  breaks_found INT,
+  first_break_id BIGINT,
+  status TEXT NOT NULL CHECK (status IN ('pass','fail'))
+);
+
+CREATE OR REPLACE FUNCTION core.job_verify_audit_chain(p_window INTERVAL DEFAULT '24 hours')
+RETURNS TEXT LANGUAGE plpgsql AS $$
+DECLARE v_breaks INT := 0; v_rows BIGINT := 0; v_first BIGINT;
+BEGIN
+  WITH chain AS (
+    SELECT audit_id, row_hash, prev_hash,
+           lag(row_hash) OVER (ORDER BY audit_id) AS expected_prev
+      FROM core.audit_log
+     WHERE occurred_at > now() - p_window)
+  SELECT count(*), count(*) FILTER (WHERE prev_hash IS DISTINCT FROM expected_prev
+                                      AND expected_prev IS NOT NULL),
+         min(audit_id) FILTER (WHERE prev_hash IS DISTINCT FROM expected_prev
+                                 AND expected_prev IS NOT NULL)
+    INTO v_rows, v_breaks, v_first
+    FROM chain;
+
+  INSERT INTO core.integrity_check (rows_checked, breaks_found, first_break_id, status)
+  VALUES (v_rows, v_breaks, v_first, CASE WHEN v_breaks = 0 THEN 'pass' ELSE 'fail' END);
+
+  IF v_breaks > 0 THEN
+    INSERT INTO core.notification (tenant_id, channel, subject, body)
+    SELECT tenant_id, 'email', 'CRITICAL: audit chain integrity failure',
+           format('%s hash breaks detected starting at audit_id %s', v_breaks, v_first)
+      FROM core.tenant WHERE is_internal LIMIT 1;
+  END IF;
+
+  RETURN format('rows=%s breaks=%s', v_rows, v_breaks);
+END $$;
+
+-- 10. Notification dispatcher (marks for external worker pickup)
+CREATE OR REPLACE FUNCTION core.job_expire_stale_notifications()
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT;
+BEGIN
+  UPDATE core.notification
+     SET status = 'failed', error_text = 'max attempts exceeded'
+   WHERE status = 'queued' AND attempts >= 5;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END $$;
+
+-- 11. Refresh reporting layer
+CREATE OR REPLACE FUNCTION core.job_refresh_reporting()
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  REFRESH MATERIALIZED VIEW CONCURRENTLY rpt.mv_client_360;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY rpt.mv_engagement_economics;
+  REFRESH MATERIALIZED VIEW rpt.mv_compliance_calendar;
+END $$;
+
+-- ---------- SCHEDULE ----------
+SELECT cron.schedule('kyc-review-scheduler', '0 6 * * *',
+       $$SELECT core.job_kyc_review_scheduler()$$);
+
+SELECT cron.schedule('cert-expiry-watch', '0 7 * * *',
+       $$SELECT core.job_certificate_expiry_watch()$$);
+
+SELECT cron.schedule('sanctions-rescreen', '0 2 * * *',
+       $$SELECT core.job_queue_rescreening()$$);
+
+SELECT cron.schedule('sla-escalation', '0 * * * *',
+       $$SELECT core.job_sla_escalation()$$);
+
+SELECT cron.schedule('retention-sweep', '0 3 * * 0',
+       $$SELECT core.job_retention_sweep()$$);
+
+SELECT cron.schedule('governance-review', '0 8 * * 1',
+       $$SELECT core.job_governance_review()$$);
+
+SELECT cron.schedule('portal-reminders', '0 9 * * 1-5',
+       $$SELECT core.job_portal_reminders()$$);
+
+SELECT cron.schedule('revoke-expired-shares', '*/15 * * * *',
+       $$SELECT core.job_revoke_expired_shares()$$);
+
+SELECT cron.schedule('audit-chain-verify', '30 4 * * *',
+       $$SELECT core.job_verify_audit_chain('26 hours')$$);
+
+SELECT cron.schedule('expire-notifications', '*/10 * * * *',
+       $$SELECT core.job_expire_stale_notifications()$$);
+
+SELECT cron.schedule('refresh-reporting', '*/30 * * * *',
+       $$SELECT core.job_refresh_reporting()$$);
+
+SELECT cron.schedule('audit-partitions', '0 1 1 * *',
+       $$SELECT core.fn_ensure_audit_partitions(6)$$);
+
+SELECT cron.schedule('vacuum-analyze', '0 4 * * 0',
+       $$VACUUM ANALYZE$$);
+```
+
+---
+
+## SECTION 13: SEED DATA (THE INSTITUTIONAL STACK)
+
+```sql
+-- ============================================================
+-- 13_SEED
+-- ============================================================
+
+INSERT INTO core.tenant (tenant_code, legal_name, is_internal)
+VALUES ('INTUNE', 'In.Tune & Associates Inc.', true);
+
+INSERT INTO frame.framework (framework_code, framework_name, purpose, core_question) VALUES
+('GRC-A','Governance & Control Assurance Framework',
+ 'Executive and governance layer. Evaluates if governance structure, accountability, risk processes, and controls function as intended.',
+ 'Can this organization govern itself effectively?'),
+('ICAEF','Integrated Control Assurance & Examination Framework',
+ 'Examination and evidentiary layer. Establishes methodology for examinations.',
+ 'Can the conclusion be defended through evidence?'),
+('REG-C','Regulated Environment Governance Framework',
+ 'Evaluates ability to operate in environments requiring heightened accountability, oversight, and compliance.',
+ 'Is the organization governable under scrutiny?'),
+('TRM','Treasury & Relationship Management Framework',
+ 'Governs stewardship of financial resources, banking relationships, liquidity management, and transaction accountability.',
+ 'Are financial resources properly governed?'),
+('TRUSTFABRIC','Identity, Authority & Transaction Assurance Framework',
+ 'Digital trust layer. No Proof, No Payment. Integrates identity, authority, policy, transaction approval, cryptographic trust.',
+ 'Can identity, authority, and transactions be trusted?');
+
+-- GRC-A domains
+INSERT INTO frame.domain (framework_id, domain_code, domain_name, sort_order)
+SELECT framework_id, d.code, d.name, d.ord
+  FROM frame.framework f,
+  (VALUES ('GO','Governance & Oversight',1),
+          ('RC','Risk & Compliance',2),
+          ('FTC','Financial & Treasury Controls',3),
+          ('OA','Operational Accountability',4),
+          ('FIM','Fraud & Integrity Management',5)) AS d(code,name,ord)
+ WHERE f.framework_code = 'GRC-A';
+
+-- REG-C domains
+INSERT INTO frame.domain (framework_id, domain_code, domain_name, sort_order)
+SELECT framework_id, d.code, d.name, d.ord
+  FROM frame.framework f,
+  (VALUES ('GR','Governance Readiness',1),
+          ('DR','Documentation Readiness',2),
+          ('CT','Compliance Traceability',3),
+          ('OR','Oversight Readiness',4),
+          ('RR','Response Readiness',5)) AS d(code,name,ord)
+ WHERE f.framework_code = 'REG-C';
+
+-- TRM domains
+INSERT INTO frame.domain (framework_id, domain_code, domain_name, sort_order)
+SELECT framework_id, d.code, d.name, d.ord
+  FROM frame.framework f,
+  (VALUES ('TG','Treasury Governance',1),
+          ('LG','Liquidity Governance',2),
+          ('TXG','Transaction Governance',3),
+          ('BRG','Banking Relationship Governance',4),
+          ('FPC','Fraud Prevention Controls',5)) AS d(code,name,ord)
+ WHERE f.framework_code = 'TRM';
+
+-- ICAEF domains
+INSERT INTO frame.domain (framework_id, domain_code, domain_name, sort_order)
+SELECT framework_id, d.code, d.name, d.ord
+  FROM frame.framework f,
+  (VALUES ('CV','Control Validation',1),
+          ('FE','Financial Examination',2),
+          ('TE','Technical Examination',3),
+          ('IE','Investigative Examination',4)) AS d(code,name,ord)
+ WHERE f.framework_code = 'ICAEF';
+
+-- TrustFabric domains
+INSERT INTO frame.domain (framework_id, domain_code, domain_name, sort_order)
+SELECT framework_id, d.code, d.name, d.ord
+  FROM frame.framework f,
+  (VALUES ('IA','Identity Assurance',1),
+          ('AV','Authority Validation',2),
+          ('DA','Device Attestation',3),
+          ('CE','Cryptographic Evidence',4),
+          ('TV','Transaction Verification',5),
+          ('PE','Policy Enforcement',6)) AS d(code,name,ord)
+ WHERE f.framework_code = 'TRUSTFABRIC';
+
+-- External standards
+INSERT INTO frame.external_standard (standard_code, standard_name, authority, version) VALUES
+('NIST-CSF','NIST Cybersecurity Framework','NIST','2.0'),
+('NIST-800-53','Security and Privacy Controls','NIST','Rev 5'),
+('ISO-27001','Information Security Management','ISO','2022'),
+('SOC2','Trust Services Criteria','AICPA','2017'),
+('PCI-DSS','Payment Card Industry DSS','PCI SSC','4.0'),
+('GLBA','Gramm-Leach-Bliley Act Safeguards','FTC','2023'),
+('FFIEC','FFIEC IT Examination Handbook','FFIEC','Current'),
+('BSA-AML','Bank Secrecy Act / AML','FinCEN','Current'),
+('SOX-404','Sarbanes-Oxley Section 404','SEC/PCAOB','Current'),
+('CIS','CIS Critical Security Controls','CIS','v8.1'),
+('HIPAA','HIPAA Security Rule','HHS','Current');
+
+-- Retention policies
+INSERT INTO docs.retention_policy
+  (policy_code, policy_name, retention_years, trigger_event, disposition, legal_basis) VALUES
+('RET-BSA-5','BSA/AML Records', 5, 'relationship_end','review','31 CFR 1010.430'),
+('RET-ENG-7','Engagement Workpapers', 7, 'engagement_close','review','AICPA / SOX 103(a)'),
+('RET-SOX-7','SOX Audit Records', 7, 'fiscal_year_end','review','SOX Section 802'),
+('RET-CORP-P','Corporate Records', 99,'creation','archive','Permanent retention'),
+('RET-GEN-3','General Correspondence', 3, 'creation','destroy','Internal policy'),
+('RET-CERT-10','Certificate & PKI Records', 10,'creation','archive','CA/Browser Forum BR 5.4.3'),
+('RET-TAX-7','Tax Records', 7, 'fiscal_year_end','review','IRC 6501');
+
+-- Roles
+INSERT INTO core.role (role_code, role_name, scope) VALUES
+('SYS_ADMIN','System Administrator','system'),
+('MANAGING_PRINCIPAL','Managing Principal','internal'),
+('ENG_PARTNER','Engagement Partner','internal'),
+('ENG_MANAGER','Engagement Manager','internal'),
+('ASSESSOR','Assessor / Examiner','internal'),
+('QA_REVIEWER','QA Reviewer','internal'),
+('COMPLIANCE_OFFICER','Compliance Officer','internal'),
+('BSA_OFFICER','BSA/AML Officer','internal'),
+('RA_OPERATOR','Registration Authority Operator','internal'),
+('TREASURY_ANALYST','Treasury Analyst','internal'),
+('CLIENT_ADMIN','Client Administrator','client'),
+('CLIENT_USER','Client User','client'),
+('CLIENT_SIGNER','Client Signatory','client');
+
+-- Permissions (representative)
+INSERT INTO core.permission (perm_code, resource, action) VALUES
+('intake.kyc.read','kyc_case','read'),
+('intake.kyc.write','kyc_case','write'),
+('intake.kyc.approve','kyc_case','approve'),
+('intake.sar.read','sar_case','read'),
+('intake.sar.file','sar_case','file'),
+('intake.screening.disposition','screening_hit','disposition'),
+('engage.case.confidential','case','read_confidential'),
+('engage.note.privileged','case_note','read_privileged'),
+('frame.workpaper.prepare','workpaper','prepare'),
+('frame.workpaper.review','workpaper','review'),
+('frame.assessment.issue','assessment','issue'),
+('frame.certificate.issue','certificate','issue'),
+('frame.certificate.revoke','certificate','revoke'),
+('docs.legalhold.set','document','legal_hold'),
+('docs.disposition.execute','document','dispose'),
+('gov.policy.approve','policy','approve'),
+('core.user.admin','app_user','admin');
+
+-- SoD conflicts
+INSERT INTO core.sod_conflict (role_a_id, role_b_id, severity, rationale)
+SELECT a.role_id, b.role_id, 'high',
+       'Preparer of workpapers may not perform independent QA review of the same engagement.'
+  FROM core.role a, core.role b
+ WHERE a.role_code = 'ASSESSOR' AND b.role_code = 'QA_REVIEWER';
+
+INSERT INTO core.sod_conflict (role_a_id, role_b_id, severity, rationale)
+SELECT a.role_id, b.role_id, 'critical',
+       'RA certificate issuance authority must be segregated from system administration.'
+  FROM core.role a, core.role b
+ WHERE a.role_code = 'RA_OPERATOR' AND b.role_code = 'SYS_ADMIN';
+
+-- Risk factors
+INSERT INTO intake.risk_factor (factor_code, category, factor_name, weight, scoring_rule) VALUES
+('GEO-HIGH','geographic','High-risk jurisdiction', 3.0,
+ '{"type":"list_match","source":"fatf_grey_black","score_on_match":5}'::jsonb),
+('CUST-PEP','customer','Politically exposed person', 3.0,
+ '{"type":"boolean","field":"is_pep","score_if_true":5}'::jsonb),
+('CUST-CASH','customer','Cash-intensive business', 2.0,
+ '{"type":"naics_match","score_on_match":4}'::jsonb),
+('CUST-STRUCT','customer','Complex ownership structure', 2.0,
+ '{"type":"threshold","field":"ownership_layers","gt":3,"score":4}'::jsonb),
+('PROD-WIRE','product','International wire activity', 2.0,
+ '{"type":"boolean","score_if_true":3}'::jsonb),
+('CHAN-NONFACE','channel','Non-face-to-face onboarding', 1.5,
+ '{"type":"boolean","score_if_true":3}'::jsonb),
+('CUST-REG','customer','Regulated financial institution', -1.0,
+ '{"type":"boolean","field":"is_regulated","score_if_true":-2}'::jsonb);
+
+-- KB spaces
+INSERT INTO kb.space (space_code, name, visibility) VALUES
+('METHOD','Methodology & Frameworks','internal'),
+('REG','Regulatory Library','internal'),
+('PLAY','Engagement Playbooks','internal'),
+('CLIENT','Client Resource Center','client'),
+('RND','Research & Development','restricted');
+
+-- Attach triggers to every audited table
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT c.table_schema, c.table_name,
+           (SELECT a.column_name FROM information_schema.columns a
+             WHERE a.table_schema = c.table_schema AND a.table_name = c.table_name
+             ORDER BY a.ordinal_position LIMIT 1) AS pk_col
+      FROM information_schema.tables c
+     WHERE c.table_schema IN ('core','crm','intake','engage','frame','docs','portal','kb','gov')
+       AND c.table_type = 'BASE TABLE'
+       AND c.table_name NOT IN ('audit_log','integrity_check','document_access_log','notification')
+  LOOP
+    PERFORM core.fn_attach_standard_triggers(r.table_schema, r.table_name, r.pk_col);
+  END LOOP;
+END $$;
+```
+
+---
+
+## SECTION 14: DOCKER DEPLOYMENT
+
+```yaml
+# docker-compose.yml
+name: intune-erp
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: intune-pg
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: intune
+      POSTGRES_USER: intune_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_cron,pg_stat_statements
+      -c cron.database_name=intune
+      -c max_connections=200
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=512MB
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='pgbackrest --stanza=intune archive-push %p'
+      -c log_statement=ddl
+      -c log_min_duration_statement=1000
+      -c log_connections=on
+      -c log_disconnections=on
+      -c ssl=on
+      -c ssl_cert_file=/certs/server.crt
+      -c ssl_key_file=/certs/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+      - ./certs:/certs:ro
+    secrets: [pg_password]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U intune_admin -d intune"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: intune-redis
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes: [redisdata:/data]
+    networks: [data]
+    logging: *default-logging
+
+  minio:
+    image: minio/minio:latest
+    container_name: intune-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_SERVER_URL: https://files.trustintune.com
+    volumes: [miniodata:/data]
+    networks: [data, app]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+    logging: *default-logging
+
+  nocobase:
+    image: nocobase/nocobase:latest
+    container_name: intune-nocobase
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB_DIALECT: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: intune
+      DB_USER: nocobase_app
+      DB_PASSWORD: ${NOCOBASE_DB_PASSWORD}
+      DB_UNDERSCORED: "true"
+      APP_KEY: ${NOCOBASE_APP_KEY}
+      APP_PORT: 13000
+      ENCRYPTION_FIELD_KEY: ${NOCOBASE_ENC_KEY}
+      LOGGER_LEVEL: info
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    volumes: [nocobase_storage:/app/nocobase/storage]
+    networks: [data, app]
+    logging: *default-logging
+
+  clamav:
+    image: clamav/clamav:latest
+    container_name: intune-clamav
+    restart: unless-stopped
+    volumes: [clamdb:/var/lib/clamav]
+    networks: [app]
+    logging: *default-logging
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: intune-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n_app
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: automation.trustintune.com
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://automation.trustintune.com/
+      GENERIC_TIMEZONE: America/Denver
+      N8N_DIAGNOSTICS_ENABLED: "false"
+    volumes: [n8ndata:/home/node/.n8n]
+    networks: [data, app]
+    logging: *default-logging
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: intune-metabase
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase_app
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_SECRET}
+      JAVA_TIMEZONE: America/Denver
+    networks: [data, app]
+    logging: *default-logging
+
+  pgbackrest:
+    image: pgbackrest/pgbackrest:latest
+    container_name: intune-backup
+    restart: unless-stopped
+    depends_on: [postgres]
+    volumes:
+      - pgdata:/var/lib/postgresql/data:ro
+      - backups:/var/lib/pgbackrest
+      - ./pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks: [data]
+    logging: *default-logging
+
+  nginx:
+    image: nginx:alpine
+    container_name: intune-nginx
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on: [nocobase, metabase, n8n]
+    networks: [app]
+    logging: *default-logging
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  nocobase_storage: {}
+  n8ndata: {}
+  clamdb: {}
+  backups: {}
+  nginx_cache: {}
+
+networks:
+  data:
+    internal: true      # no egress — DB tier isolated
+  app:
+    driver: bridge
+
+secrets:
+  pg_password:
+    file: ./secrets/pg_password.txt
+```
+
+**NGINX reverse proxy** (`nginx/conf.d/intune.conf`):
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
+limit_req_zone $binary_remote_addr zone=auth:10m rate=5r/m;
+
+server {
+  listen 80 default_server;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name erp.trustintune.com;
+
+  ssl_certificate     /etc/nginx/certs/fullchain.pem;
+  ssl_certificate_key /etc/nginx/certs/privkey.pem;
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  ssl_ciphers         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+  ssl_prefer_server_ciphers off;
+  ssl_session_cache   shared:SSL:10m;
+  ssl_stapling on;
+
+  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Content-Security-Policy "default-src 'self'; frame-ancestors 'self'" always;
+
+  client_max_body_size 200m;
+
+  location /api/auth {
+    limit_req zone=auth burst=3 nodelay;
+    proxy_pass http://nocobase:13000;
+    include /etc/nginx/conf.d/proxy_common.inc;
+  }
+
+  location / {
+    limit_req zone=api burst=40 nodelay;
+    proxy_pass http://nocobase:13000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    include /etc/nginx/conf.d/proxy_common.inc;
+  }
+}
+
+server {
+  listen 443 ssl http2;
+  server_name reports.trustintune.com;
+  ssl_certificate     /etc/nginx/certs/fullchain.pem;
+  ssl_certificate_key /etc/nginx/certs/privkey.pem;
+  location / {
+    proxy_pass http://metabase:3000;
+    include /etc/nginx/conf.d/proxy_common.inc;
+  }
+}
+```
+
+**Database role separation** (`sql/99_roles.sql`):
+
+```sql
+-- Application roles — least privilege
+CREATE ROLE intune_readonly NOLOGIN;
+CREATE ROLE intune_app NOLOGIN;
+
+GRANT USAGE ON SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt TO intune_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt
+  TO intune_readonly;
+
+GRANT USAGE ON SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov,rpt TO intune_app;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA
+  core,crm,intake,engage,frame,docs,portal,kb,gov TO intune_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA rpt TO intune_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA core,crm,intake,engage,frame,docs,portal,kb,gov
+  TO intune_app;
+
+-- Nobody deletes audit
+REVOKE UPDATE, DELETE, TRUNCATE ON core.audit_log FROM intune_app, intune_readonly;
+
+CREATE USER nocobase_app WITH PASSWORD :'nocobase_pw' IN ROLE intune_app;
+CREATE USER metabase_app WITH PASSWORD :'metabase_pw' IN ROLE intune_readonly;
+
+ALTER ROLE nocobase_app SET row_security = on;
+ALTER ROLE metabase_app SET row_security = on;
+```
+
+---
+
+## SECTION 15: BACKUP & DR
+
+```ini
+# pgbackrest.conf
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=4
+repo1-retention-diff=7
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=<from-secrets>
+repo1-s3-bucket=intune-pg-backups
+repo1-s3-endpoint=s3.eu-central-1.ionoscloud.com
+repo1-s3-region=eu-central-1
+process-max=4
+compress-type=zst
+compress-level=6
+start-fast=y
+archive-async=y
+log-level-console=info
+log-level-file=detail
+
+[intune]
+pg1-path=/var/lib/postgresql/data
+pg1-port=5432
+```
+
+```bash
+# /etc/cron.d/intune-backup
+0  1  * * 0  root  docker exec intune-backup pgbackrest --stanza=intune --type=full backup
+0  1  * * 1-6 root docker exec intune-backup pgbackrest --stanza=intune --type=diff backup
+0  */6 * * * root  docker exec intune-backup pgbackrest --stanza=intune --type=incr backup
+0  5  * * 1  root  /opt/intune/scripts/verify-restore.sh   # monthly restore test
+```
+
+**RTO/RPO targets:**
+
+| Tier | Component | RPO | RTO |
+|---|---|---|---|
+| 1 | PostgreSQL | 5 min (WAL archive) | 1 hr |
+| 1 | MinIO documents | 15 min (versioned replication) | 2 hr |
+| 2 | NocoBase config | 24 hr | 4 hr |
+| 3 | Metabase / n8n | 24 hr | 8 hr |
+
+Backup validation is not optional — `verify-restore.sh` should restore to a throwaway container, run `core.job_verify_audit_chain('100 years')`, and log the result to `core.integrity_check`. An untested backup is not a backup.
+
+---
+
+## SECTION 16: DEPLOYMENT SEQUENCE
+
+```bash
+# 1. Host prep (Ubuntu 24.04 LTS on IONOS VPS)
+apt update && apt upgrade -y
+apt install -y docker.io docker-compose-v2 ufw fail2ban
+ufw default deny incoming && ufw allow 22,80,443/tcp && ufw enable
+
+# 2. Directory structure
+mkdir -p /opt/intune/{sql,certs,secrets,nginx/conf.d,scripts}
+cd /opt/intune
+
+# 3. Load SQL in order
+# 00_foundation.sql → 01_core.sql → 02_crm.sql → 03_intake.sql
+# → 04_engage.sql → 05_frame.sql → 06_docs.sql → 07_portal.sql
+# → 08_kb.sql → 09_gov.sql → 10_rls.sql → 11_rpt.sql
+# → 12_cron.sql → 13_seed.sql → 99_roles.sql
+
+# 4. Secrets
+openssl rand -base64 48 > secrets/pg_password.txt
+chmod 600 secrets/*
+
+# 5. Deploy
+docker compose up -d
+docker compose logs -f postgres
+
+# 6. Initialize backup stanza
+docker exec intune-backup pgbackrest --stanza=intune stanza-create
+docker exec intune-backup pgbackrest --stanza=intune check
+```
+
+---
+
+## OPEN DECISIONS
+
+Three things I need from you before the next layer:
+
+1. **Portal engine** — NocoBase's built-in RBAC for the client portal, or Supabase Auth + a separate Next.js portal? The RLS above assumes the latter is possible; NocoBase-only is faster but couples client UX to the admin tool.
+2. **Screening provider** — the `screening_run` table is provider-agnostic, but the n8n workflow needs a target (OFAC SDN direct file parse is free; Dow Jones/WorldCheck are paid APIs).
+3. **`frame.evidence.tier` ordering** — the `e.tier <= v_min` comparison relies on enum ordinal position where `tier_i` is *strongest*. Confirm that matches your ICAEF™ intent, or I'll invert it.
+
+Next build increments available: billing/AR (Stripe), the `intake.form_template` JSON Schema definitions for actual KYC/KYB forms, NocoBase collection definitions, or the n8n workflow set.
