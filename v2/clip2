@@ -1,0 +1,29 @@
+Starting at 1: the intake form templates.
+
+Before I write them, one honest flag. The `intake.form_template` layer is where the schema stops being generic infrastructure and starts encoding *your* actual intake process — the specific questions you ask, the thresholds you apply, the CIP elements you collect. I can build these from the FinCEN CDD Rule (31 CFR 1010.230), the CIP Rule (31 CFR 1020.220), and standard FATF-aligned practice. What I can't do is reproduce In.Tune's actual forms, because I don't have them.
+
+So there are two paths:
+
+**Path A — I build regulatory-baseline templates.** Faithful to FinCEN/CIP/CDD requirements, structured to your schema, ready to run. Then you diff them against what you actually ask clients and I adjust. This is fast and gets you a working system today.
+
+**Path B — you give me your current intake forms** (the Word docs, PDFs, or whatever you're using now — you have a `MGP-ES.pdf` and capability statements uploaded, but not the intake instruments themselves). I encode exactly what you ask, and the templates match your engagement letters and your methodology on day one.
+
+Path A is what I'd default to, with one caveat worth stating plainly: an AML program's risk-scoring thresholds and EDD triggers are the part a regulator examines hardest, and they should reflect *your* documented risk assessment — not my reasonable-sounding defaults. If I invent a cash-intensive-business threshold and it ends up in a BSA exam, that's a finding waiting to happen. The structure I can give you confidently. The specific numbers should be yours.
+
+A few things I need either way, because they change the field sets materially:
+
+<function_results>
+<system>Tool ask_user_input_v0 not found</system>
+</function_results>
+
+Let me just ask directly rather than through a picker:
+
+**1. Who are your KYC/KYB subjects?** Your capability statement says you serve "public entities, regulated organizations, financial institutions, and growing enterprises." Are you running KYC on your *own clients* as an engagement-acceptance control (professional-firm client due diligence), or are you building this so your clients can run KYC on *their* customers (a program you operate on their behalf)? These are different forms. The first is a conflict-check-plus-sanctions-screen. The second is a full CIP/CDD instrument with beneficial ownership certification.
+
+The schema as built (`intake.kyc_case` hanging off `crm.client`, `crm.beneficial_owner` on the client record) reads like the first. But `intake.sar_case` with a FinCEN BSA ID field reads like the second — professional firms don't file SARs on their own clients; financial institutions file them on customers. Worth resolving before I write field definitions, because it determines whether the form asks "what is the nature of the client's business" or "what is the expected transaction volume and source of funds."
+
+**2. Do you have a documented AML risk assessment?** The `intake.risk_factor` seed I wrote has weights I made up. If you have a board-approved risk assessment, its factors and weights should replace mine wholesale.
+
+**3. Are you the RA issuing certificates to these same entities?** If a KYB approval feeds a GlobalSign RA identity-vetting decision, the form needs to collect the specific evidence GlobalSign's RA agreement requires for OV/EV vetting — organizational existence, domain control, applicant authority. That's a different field set again, and it's the one place where CA/Browser Forum Baseline Requirements dictate the questions rather than FinCEN.
+
+Answer those three and I'll write the templates in one pass. Or say "just build the baseline" and I'll take Path A with the professional-firm-client-acceptance reading, flag every invented threshold inline as `-- TODO: replace with In.Tune risk assessment value`, and you correct from there.
