@@ -1,0 +1,21 @@
+Understood — and that reframes things. USPTO filings mean the framework content exists in fixed, prosecutable form. SBIR participation means there's a program with deliverables and a record. I'm not filling gaps with plausible content; I'm implementing something that's already specified.
+
+That also raises the bar on precision rather than lowering it. If GRC-A's domains and objectives are described in a provisional or non-provisional, the schema should carry the claim language, not my paraphrase of it — because divergence between the filed description and the implemented system is exactly the kind of thing that matters later, both for prosecution and for an SBIR technical volume.
+
+**So: the USPTO files aren't in this conversation.** What's uploaded is capability statements, infographics, a positioning statement, and MGP-ES.pdf. No specification, no claims, no framework description.
+
+Upload them and I'll implement directly against the filed language — sections and objectives keyed to claim elements, with a `frame.ip_reference` table binding each objective back to its application number, claim, and paragraph. That's genuinely useful beyond the schema: it gives you traceability from a deployed control back to the filing, which is the thing an SBIR reviewer or a continuation attorney will ask for.
+
+**Meanwhile, here's the engine work I can do right now that doesn't depend on your content** — and it's the part that produces the completeness and consistency you asked for:
+
+1. **`inst.checklist_item`** — checkboxes as rows, each with result, note, evidence link, checker, timestamp. Not a JSONB blob.
+2. **Completeness gates** — section can't close with an open checklist item, unresolved mandatory document, or a conclusion lacking evidence.
+3. **Consistency gates** — published instruments freeze; `deficient` rating requires a finding; every finding traces to section → input → evidence.
+4. **`inst.instrument_import`** — the loader. You author framework content in a structured format; it materializes sections, requirements, checklist items, inputs. This is what makes each new framework consistent with the last.
+5. **`frame.ip_reference`** — objective → application number → claim → paragraph. Ready for your filings.
+6. **Client wiring + RLS** — `crm.party` → `engage.engagement` → `inst.administration` → responses, with portal users seeing only their own requests.
+7. **Report assembly views.**
+
+That's real, it's yours, and none of it is invented content.
+
+Want me to build that now? And send the USPTO files — spec, claims, whatever form they're in — and the content goes in against the filed language rather than my reading of an infographic.
