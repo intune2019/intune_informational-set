@@ -1,0 +1,42 @@
+I need to actually read it before I say whether it helps.Let me read the truncated middle — that's where the capability detail lives.Now I've read it. Yes — this helps, and it corrects something material.
+
+## WHAT THIS DOCUMENT SETTLES
+
+**The A/B/C/D question is answered: A, and only A.** Three lines make it unambiguous:
+
+- *"Our objective is not to issue audit opinions but to provide decision-support analysis, risk identification, governance recommendations, and operational assessments."*
+- *"In.Tune does not provide statutory financial statement audit or attestation services."*
+- *"audit-aligned but extends beyond traditional internal audit functions"*
+
+You're an **assessor / decision-support firm**. Not an AML program operator, not an attestation firm. That kills a chunk of what I built:
+
+- **`sensitive.sar_case` doesn't belong.** You don't file SARs. Nobody files SARs on their own clients. It goes.
+- **`intake` as a client-facing CIP/CDD program goes.** What remains is engagement acceptance — conflict check, independence, sanctions screen on the counterparty. Much smaller.
+- **`frame.exam_rating` needs care.** "Effective / Deficient / Critical Exposure" reads like an attestation conclusion. Your positioning explicitly disclaims opinions. The ratings are fine internally, but the report language has to be observation-and-recommendation, not opinion — and the schema should carry that distinction so a report can't accidentally be drafted as an opinion.
+
+**The principal-accountability model is a schema constraint, not marketing.** *"The Managing Principal serves as engagement lead, methodology owner, quality reviewer, and final signatory."*
+
+That directly contradicts every four-eyes CHECK I wrote. `ck_qa_independent CHECK (qa_reviewer <> lead_assessor)` makes your actual operating model *illegal in your own system*. You're a one-principal firm — Eric is both. I need to remove those constraints or make them role-conditional, and instead enforce what your model actually promises: that the same person's identity is traceable across proposal → execution → review → signature. That's a *continuity* constraint, the inverse of segregation.
+
+That's a real find. Worth catching now rather than after you'd loaded data.
+
+**TRM.TG.01's "board approval" bar is probably wrong for this market.** Texas A&M Health is a university health system. "Board-approved treasury policy" maps to a Board of Regents — different governance object entirely. If your pipeline is higher-ed, healthcare, and public entities, the approval-authority question needs to accommodate regents, trustees, commissioners, and public boards, not assume a corporate board.
+
+## WHAT'S STILL MISSING
+
+This is a positioning statement for one pursuit. It tells me what you sell and how you talk about it. It does not contain:
+
+- GRC-A's objectives or exam points
+- ICAEF's evidence tier definitions
+- REG-C, TRM, TrustFabric domain content
+- Your WISP, AML program, or RA practice statement
+
+So the content gap is unchanged. But the *architecture* gap just closed, and that was the more expensive one.
+
+## WHAT I'D DO NEXT
+
+**Revise the engine against this positioning** — remove SAR, collapse intake to engagement acceptance, invert the four-eyes constraints to principal-continuity, add the opinion/observation guardrail to the report layer, and generalize the governance-authority model beyond corporate boards.
+
+Then TRM.TG.01 gets rebuilt correctly, and you review treasury content that's actually aimed at your market.
+
+Want me to do that revision now? And separately — is the Texas A&M pursuit live? If it is, there's an argument for building the instrument that engagement needs first (governance assessment for an affiliation decision) rather than TRM, because that one has a deadline and the others don't.
