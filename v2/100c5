@@ -1,0 +1,1005 @@
+Understood — the engine, built for real instruments. Not answer matrices. Each section knows what documents it needs, what the assessor reviews them against, where notes go, what gets uploaded, and what comes out.
+
+Let me build the engine now. TRM™ as the worked instantiation, because treasury is where your CTP background will catch my errors fastest.
+
+## SECTION 1: THE INSTRUMENT MODEL
+
+The distinction that makes this real rather than a questionnaire: **a section is a unit of fieldwork.** It has a purpose, a document manifest, review criteria, an evidence bar, a notes surface, and an outcome. A question is one input inside it — not the point.
+
+```sql
+-- ============================================================
+-- 30_INSTRUMENT :: THE FRAMEWORK ENGINE
+-- ============================================================
+
+CREATE SCHEMA IF NOT EXISTS inst;
+
+CREATE TYPE inst.input_kind AS ENUM (
+  'short_text','long_text','number','currency','percent','date','date_range',
+  'single_select','multi_select','boolean','yes_no_na','scale_1_5',
+  'party_ref','user_ref','document_ref','table_grid','signature','attestation',
+  'computed'
+);
+
+CREATE TYPE inst.section_kind AS ENUM (
+  'scoping',            -- defines what's in scope
+  'document_request',   -- PBC list
+  'inquiry',            -- interview / questionnaire
+  'inspection',         -- assessor reviews documents against criteria
+  'observation',        -- assessor watches a process
+  'reperformance',      -- assessor re-executes a control
+  'analytical',         -- data analysis
+  'attestation',        -- client certifies
+  'conclusion'          -- assessor rates the domain
+);
+
+CREATE TYPE inst.completion_state AS ENUM (
+  'not_started','in_progress','client_pending','ready_for_review',
+  'reviewed','reopened','complete','not_applicable'
+);
+
+-- ============================================================
+-- INSTRUMENT — versioned, published, immutable once used
+-- ============================================================
+CREATE TABLE inst.instrument (
+  instrument_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  framework_id    UUID NOT NULL REFERENCES frame.framework(framework_id),
+  instrument_code TEXT NOT NULL,
+  version         INT NOT NULL DEFAULT 1,
+  title           TEXT NOT NULL,
+  purpose         TEXT NOT NULL,
+  core_question   TEXT,
+  scope_statement TEXT,
+  intended_use    TEXT,
+  estimated_hours NUMERIC(6,2),
+  estimated_days  INT,
+
+  -- Report specification
+  report_template_code TEXT,
+  deliverables    TEXT[],          -- ['Treasury Control Register','Liquidity Risk Review']
+
+  is_published    BOOLEAN NOT NULL DEFAULT false,
+  published_at    TIMESTAMPTZ,
+  published_by    UUID REFERENCES core.app_user(user_id),
+  superseded_by   UUID REFERENCES inst.instrument(instrument_id),
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'draft',
+  CONSTRAINT uq_instrument_ver UNIQUE (instrument_code, version)
+);
+
+-- Published instruments are frozen. Change = new version.
+CREATE OR REPLACE FUNCTION inst.fn_freeze_published()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.is_published AND NEW.is_published
+     AND (OLD.instrument_code, OLD.version) IS DISTINCT FROM (NEW.instrument_code, NEW.version) THEN
+    RAISE EXCEPTION 'Instrument %v% is published and cannot be altered. Create a new version.',
+      OLD.instrument_code, OLD.version;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER trg_freeze_instrument BEFORE UPDATE ON inst.instrument
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_freeze_published();
+
+-- ============================================================
+-- SECTION — a unit of fieldwork, not a page of a form
+-- ============================================================
+CREATE TABLE inst.section (
+  section_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  instrument_id   UUID NOT NULL REFERENCES inst.instrument(instrument_id) ON DELETE CASCADE,
+  domain_id       UUID REFERENCES frame.domain(domain_id),
+  parent_section_id UUID REFERENCES inst.section(section_id) ON DELETE CASCADE,
+
+  section_code    TEXT NOT NULL,        -- 'TRM.TG.01'
+  title           TEXT NOT NULL,
+  section_kind    inst.section_kind NOT NULL,
+  sort_order      INT NOT NULL DEFAULT 0,
+
+  -- WHAT THIS SECTION IS FOR
+  purpose         TEXT NOT NULL,
+  what_we_assess  TEXT NOT NULL,
+  why_it_matters  TEXT,
+
+  -- WHAT THE ASSESSOR REVIEWS AGAINST
+  review_criteria TEXT NOT NULL,        -- the "according to this"
+  criteria_refs   TEXT[],               -- ['FFIEC BSA/AML - Internal Controls','NIST CSF GV.RM-01']
+  red_flags       TEXT[],               -- what a deficiency looks like
+  good_practice   TEXT,                 -- what "effective" looks like
+
+  -- EVIDENCE BAR
+  min_evidence_tier frame.evidence_tier NOT NULL DEFAULT 'tier_ii',
+  evidence_guidance TEXT,
+  sample_guidance   TEXT,
+  min_sample_size   INT,
+
+  -- WHO
+  performed_by_role TEXT,               -- 'ASSESSOR','TREASURY_ANALYST'
+  client_role_required TEXT,            -- 'Treasurer','CFO','Controller'
+
+  -- NOTES SURFACE
+  requires_narrative BOOLEAN NOT NULL DEFAULT true,
+  narrative_prompt   TEXT,
+  requires_conclusion BOOLEAN NOT NULL DEFAULT false,
+
+  -- SCORING
+  weight          NUMERIC(5,2) NOT NULL DEFAULT 1.0,
+  is_key_section  BOOLEAN NOT NULL DEFAULT false,
+  na_permitted    BOOLEAN NOT NULL DEFAULT true,
+  na_requires_rationale BOOLEAN NOT NULL DEFAULT true,
+
+  -- CONDITIONAL DISPLAY
+  show_when       JSONB,                -- {"field":"TRM.TG.01.Q3","op":"eq","value":true}
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_section_code UNIQUE (instrument_id, section_code)
+);
+CREATE INDEX ix_section_instr ON inst.section (instrument_id, sort_order);
+
+COMMENT ON TABLE inst.section IS
+  'A unit of fieldwork. Carries purpose, review criteria, document manifest,
+   evidence bar, notes surface, and outcome. Questions are inputs inside it.';
+
+-- ============================================================
+-- DOCUMENT MANIFEST — "I need this and that"
+-- ============================================================
+CREATE TABLE inst.document_requirement (
+  requirement_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  section_id      UUID NOT NULL REFERENCES inst.section(section_id) ON DELETE CASCADE,
+  req_code        TEXT NOT NULL,        -- 'TRM.TG.01.D1'
+  sort_order      INT NOT NULL DEFAULT 0,
+
+  document_name   TEXT NOT NULL,        -- 'Treasury Policy'
+  description     TEXT NOT NULL,        -- what specifically
+  doc_type        TEXT,                 -- maps to docs.document.doc_type
+  format_expected TEXT,                 -- 'PDF, signed and dated'
+  period_covered  TEXT,                 -- 'Current effective version + prior 2 years'
+
+  is_mandatory    BOOLEAN NOT NULL DEFAULT true,
+  alternatives_accepted TEXT,           -- 'If no formal policy, board minutes evidencing...'
+
+  -- WHAT THE ASSESSOR CHECKS ON RECEIPT
+  review_checklist TEXT[] NOT NULL,     -- ['Is it board-approved?','Is it within review cycle?']
+  acceptance_criteria TEXT,
+  common_deficiencies TEXT[],
+
+  evidence_tier   frame.evidence_tier NOT NULL DEFAULT 'tier_ii',
+  requested_from_role TEXT,             -- 'Treasurer'
+  lead_time_days  INT DEFAULT 5,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_docreq UNIQUE (section_id, req_code)
+);
+
+-- ============================================================
+-- INPUT — the actual fields
+-- ============================================================
+CREATE TABLE inst.input (
+  input_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  section_id      UUID NOT NULL REFERENCES inst.section(section_id) ON DELETE CASCADE,
+  input_code      TEXT NOT NULL,        -- 'TRM.TG.01.Q1'
+  sort_order      INT NOT NULL DEFAULT 0,
+
+  label           TEXT NOT NULL,
+  help_text       TEXT,
+  assessor_guidance TEXT,               -- what the assessor should be probing for
+  input_kind      inst.input_kind NOT NULL,
+
+  is_required     BOOLEAN NOT NULL DEFAULT true,
+  answered_by     TEXT NOT NULL DEFAULT 'assessor'
+                  CHECK (answered_by IN ('assessor','client','system')),
+
+  -- Constraints
+  options         JSONB,                -- [{"value":"yes","label":"Yes","risk_score":0}]
+  validation      JSONB,                -- {"min":0,"max":100,"pattern":"..."}
+  default_value   JSONB,
+  placeholder     TEXT,
+  unit            TEXT,
+
+  -- Grid definition when input_kind='table_grid'
+  grid_columns    JSONB,                -- [{"key":"bank","label":"Institution","kind":"short_text"}]
+  grid_min_rows   INT,
+  grid_max_rows   INT,
+
+  -- Computation when input_kind='computed'
+  compute_expr    TEXT,                 -- SQL-ish expr over sibling inputs
+
+  -- RISK CONTRIBUTION
+  risk_weight     NUMERIC(5,2) NOT NULL DEFAULT 0,
+  risk_rule       JSONB,                -- {"type":"map","map":{"no":5,"partial":3,"yes":0}}
+
+  -- FOLLOW-ON
+  triggers_finding_when JSONB,          -- {"op":"eq","value":"no"}
+  finding_template TEXT,
+  requires_note_when JSONB,
+  requires_document_when JSONB,
+
+  show_when       JSONB,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_input_code UNIQUE (section_id, input_code)
+);
+CREATE INDEX ix_input_section ON inst.input (section_id, sort_order);
+```
+
+---
+
+## SECTION 2: EXECUTION — administering the instrument
+
+```sql
+-- ============================================================
+-- 31_ENGAGEMENT_INSTRUMENT :: running it in the field
+-- ============================================================
+
+CREATE TABLE inst.administration (
+  administration_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id       UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  engagement_id   UUID NOT NULL REFERENCES engage.engagement(engagement_id),
+  instrument_id   UUID NOT NULL REFERENCES inst.instrument(instrument_id),
+  party_id        UUID NOT NULL REFERENCES crm.party(party_id),
+
+  admin_number    TEXT NOT NULL UNIQUE,   -- 'TRM-2026-0001'
+  period_start    DATE NOT NULL,
+  period_end      DATE NOT NULL,
+  as_of_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+
+  status          TEXT NOT NULL DEFAULT 'planning'
+                  CHECK (status IN ('planning','document_request','fieldwork','analysis',
+                                    'draft_report','client_review','final','archived')),
+
+  lead_assessor   UUID REFERENCES core.app_user(user_id),
+  qa_reviewer     UUID REFERENCES core.app_user(user_id),
+  engagement_partner UUID REFERENCES core.app_user(user_id),
+
+  -- Computed outcomes
+  overall_rating  frame.exam_rating,
+  maturity_score  NUMERIC(3,2) CHECK (maturity_score BETWEEN 0 AND 5),
+  risk_score      NUMERIC(6,2),
+  completion_pct  NUMERIC(5,2) NOT NULL DEFAULT 0,
+
+  fieldwork_start DATE, fieldwork_end DATE,
+  issued_at       TIMESTAMPTZ,
+  report_document_id UUID REFERENCES docs.document(document_id),
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_admin_period CHECK (period_end >= period_start),
+  CONSTRAINT ck_admin_qa CHECK (qa_reviewer IS NULL OR qa_reviewer <> lead_assessor)
+);
+CREATE INDEX ix_admin_eng ON inst.administration (engagement_id, status);
+
+-- ---------- SECTION EXECUTION ----------
+CREATE TABLE inst.section_response (
+  section_response_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  section_id      UUID NOT NULL REFERENCES inst.section(section_id),
+
+  state           inst.completion_state NOT NULL DEFAULT 'not_started',
+
+  -- THE NOTES SECTION
+  narrative       TEXT,                 -- what the assessor observed
+  work_performed  TEXT,                 -- what the assessor actually did
+  conclusion      TEXT,
+  rating          frame.exam_rating,
+
+  na_rationale    TEXT,
+
+  -- Sampling
+  population_size INT,
+  sample_size     INT,
+  sample_method   TEXT CHECK (sample_method IN
+                  ('random','judgmental','systematic','full_population','haphazard')),
+  exceptions_noted INT NOT NULL DEFAULT 0,
+
+  -- Scoring
+  section_risk_score NUMERIC(6,2),
+  maturity_level  NUMERIC(3,2) CHECK (maturity_level BETWEEN 0 AND 5),
+
+  performed_by    UUID REFERENCES core.app_user(user_id),
+  performed_at    TIMESTAMPTZ,
+  reviewed_by     UUID REFERENCES core.app_user(user_id),
+  reviewed_at     TIMESTAMPTZ,
+  review_notes    TEXT,
+  is_locked       BOOLEAN NOT NULL DEFAULT false,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+
+  CONSTRAINT uq_sect_resp UNIQUE (administration_id, section_id),
+  CONSTRAINT ck_sect_four_eyes CHECK (reviewed_by IS NULL OR reviewed_by <> performed_by),
+  CONSTRAINT ck_sect_na CHECK (state <> 'not_applicable' OR na_rationale IS NOT NULL),
+  CONSTRAINT ck_sample_le_pop CHECK (sample_size IS NULL OR population_size IS NULL
+                                     OR sample_size <= population_size)
+);
+
+-- ---------- INPUT VALUES ----------
+CREATE TABLE inst.input_response (
+  input_response_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  section_response_id UUID NOT NULL
+    REFERENCES inst.section_response(section_response_id) ON DELETE CASCADE,
+  input_id        UUID NOT NULL REFERENCES inst.input(input_id),
+
+  value_json      JSONB,                -- normalized: {"v": <any>}
+  value_text      TEXT GENERATED ALWAYS AS (value_json ->> 'v') STORED,
+  note            TEXT,                 -- per-input note
+  is_exception    BOOLEAN NOT NULL DEFAULT false,
+
+  computed_risk   NUMERIC(5,2),
+
+  answered_by     UUID REFERENCES core.app_user(user_id),
+  answered_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source          TEXT NOT NULL DEFAULT 'assessor'
+                  CHECK (source IN ('assessor','client_portal','import','system')),
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_input_resp UNIQUE (section_response_id, input_id)
+);
+CREATE INDEX ix_inputresp_val ON inst.input_response USING gin (value_json jsonb_path_ops);
+
+-- ---------- DOCUMENT COLLECTION ----------
+CREATE TABLE inst.document_collection (
+  collection_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  requirement_id  UUID NOT NULL REFERENCES inst.document_requirement(requirement_id),
+  section_response_id UUID REFERENCES inst.section_response(section_response_id) ON DELETE CASCADE,
+
+  status          TEXT NOT NULL DEFAULT 'requested'
+                  CHECK (status IN ('requested','reminded','received','under_review',
+                                    'accepted','rejected','waived','not_available')),
+
+  requested_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  requested_from  UUID REFERENCES crm.party(party_id),
+  due_date        DATE,
+  received_at     TIMESTAMPTZ,
+  reminder_count  INT NOT NULL DEFAULT 0,
+  last_reminder_at TIMESTAMPTZ,
+
+  -- REVIEW OUTCOME — the checklist gets answered here
+  checklist_results JSONB,              -- [{"item":"Board-approved?","result":"yes","note":"..."}]
+  review_notes    TEXT,
+  rejection_reason TEXT,
+  waiver_rationale TEXT,
+  reviewed_by     UUID REFERENCES core.app_user(user_id),
+  reviewed_at     TIMESTAMPTZ,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_doccoll UNIQUE (administration_id, requirement_id),
+  CONSTRAINT ck_waiver CHECK (status <> 'waived' OR waiver_rationale IS NOT NULL)
+);
+CREATE INDEX ix_doccoll_open ON inst.document_collection (due_date, status)
+  WHERE status IN ('requested','reminded');
+
+-- Uploaded files against a requirement (M:N — one req may take several files)
+CREATE TABLE inst.collected_document (
+  collected_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  collection_id   UUID NOT NULL REFERENCES inst.document_collection(collection_id) ON DELETE CASCADE,
+  document_id     UUID NOT NULL REFERENCES docs.document(document_id),
+  evidence_id     UUID,                 -- promoted to evidence when accepted
+  uploaded_by     UUID REFERENCES core.app_user(user_id),
+  uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_collected UNIQUE (collection_id, document_id)
+);
+
+-- ---------- EVIDENCE (rebased onto administration) ----------
+CREATE TABLE inst.evidence (
+  evidence_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  section_response_id UUID NOT NULL
+    REFERENCES inst.section_response(section_response_id) ON DELETE CASCADE,
+  document_id     UUID REFERENCES docs.document(document_id),
+
+  evidence_ref    TEXT NOT NULL,        -- 'TRM.TG.01.E1'
+  description     TEXT NOT NULL,
+  tier            frame.evidence_tier NOT NULL,
+  source          TEXT NOT NULL CHECK (source IN
+                  ('client_provided','independently_obtained','system_generated',
+                   'third_party_confirmed','observed','reperformed')),
+  obtained_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  obtained_by     UUID REFERENCES core.app_user(user_id),
+  sha256_hash     TEXT,
+  is_sufficient   BOOLEAN,
+  sufficiency_rationale TEXT,
+  reliability_notes TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_evidence_ref UNIQUE (administration_id, evidence_ref)
+);
+CREATE INDEX ix_inst_evidence ON inst.evidence (section_response_id, tier);
+
+ALTER TABLE inst.collected_document
+  ADD CONSTRAINT fk_collected_evidence
+  FOREIGN KEY (evidence_id) REFERENCES inst.evidence(evidence_id);
+
+-- ---------- INTERVIEWS ----------
+CREATE TABLE inst.interview (
+  interview_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  section_response_id UUID REFERENCES inst.section_response(section_response_id),
+  interviewee_party_id UUID REFERENCES crm.party(party_id),
+  interviewee_name TEXT NOT NULL,
+  interviewee_title TEXT,
+  conducted_at    TIMESTAMPTZ NOT NULL,
+  duration_minutes INT,
+  location        TEXT,
+  attendees       TEXT[],
+  topics_covered  TEXT[],
+  notes           TEXT NOT NULL,
+  key_assertions  TEXT[],
+  corroboration_needed TEXT,
+  conducted_by    UUID NOT NULL REFERENCES core.app_user(user_id),
+  confirmed_by_interviewee BOOLEAN NOT NULL DEFAULT false,
+  confirmed_at    TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- ---------- FINDINGS (rebased) ----------
+CREATE TABLE inst.finding (
+  finding_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  section_response_id UUID REFERENCES inst.section_response(section_response_id),
+  finding_number  TEXT NOT NULL,
+  title           TEXT NOT NULL,
+  condition       TEXT NOT NULL,
+  criteria        TEXT NOT NULL,
+  criteria_refs   TEXT[],
+  cause           TEXT,
+  effect          TEXT,
+  recommendation  TEXT NOT NULL,
+  severity        core.risk_rating NOT NULL,
+  rating          frame.exam_rating NOT NULL,
+  is_repeat       BOOLEAN NOT NULL DEFAULT false,
+  prior_finding_id UUID REFERENCES inst.finding(finding_id),
+  mgmt_response   TEXT,
+  mgmt_owner      TEXT,
+  target_remediation_date DATE,
+  status          TEXT NOT NULL DEFAULT 'draft'
+                  CHECK (status IN ('draft','open','in_remediation','remediated',
+                                    'validated','accepted_risk','closed')),
+  auto_generated  BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_inst_finding UNIQUE (administration_id, finding_number)
+);
+```
+
+---
+
+## SECTION 3: THE ENFORCEMENT LAYER
+
+This is what makes it an audit rather than a form.
+
+```sql
+-- ============================================================
+-- 32_ENGINE_RULES
+-- ============================================================
+
+-- ---------- Evidence before conclusion (ICAEF, enforced) ----------
+CREATE OR REPLACE FUNCTION inst.fn_require_evidence()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_min frame.evidence_tier; v_kind inst.section_kind; v_code TEXT; v_count INT;
+BEGIN
+  IF NEW.rating IS NULL OR (OLD.rating IS NOT DISTINCT FROM NEW.rating) THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT s.min_evidence_tier, s.section_kind, s.section_code
+    INTO v_min, v_kind, v_code
+    FROM inst.section s WHERE s.section_id = NEW.section_id;
+
+  -- Scoping and document-request sections don't carry conclusions
+  IF v_kind IN ('scoping','document_request') THEN RETURN NEW; END IF;
+
+  SELECT count(*) INTO v_count
+    FROM inst.evidence e
+   WHERE e.section_response_id = NEW.section_response_id
+     AND e.is_sufficient IS TRUE
+     AND e.tier <= v_min;
+
+  IF v_count = 0 THEN
+    RAISE EXCEPTION
+      'ICAEF: section % cannot be rated without at least one sufficient % (or stronger) evidence item.',
+      v_code, v_min;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_inst_require_evidence
+  BEFORE UPDATE ON inst.section_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_require_evidence();
+
+-- ---------- Mandatory documents must be resolved ----------
+CREATE OR REPLACE FUNCTION inst.fn_require_documents()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_open INT; v_code TEXT;
+BEGIN
+  IF NEW.state NOT IN ('ready_for_review','complete') THEN RETURN NEW; END IF;
+
+  SELECT s.section_code INTO v_code FROM inst.section s WHERE s.section_id = NEW.section_id;
+
+  SELECT count(*) INTO v_open
+    FROM inst.document_requirement dr
+    LEFT JOIN inst.document_collection dc
+      ON dc.requirement_id = dr.requirement_id
+     AND dc.administration_id = NEW.administration_id
+   WHERE dr.section_id = NEW.section_id
+     AND dr.is_mandatory
+     AND dr.record_status = 'active'
+     AND COALESCE(dc.status, 'requested') NOT IN ('accepted','waived','not_available');
+
+  IF v_open > 0 THEN
+    RAISE EXCEPTION
+      'Section % has % mandatory document requirement(s) unresolved. Accept, waive, or mark unavailable first.',
+      v_code, v_open;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_inst_require_docs
+  BEFORE UPDATE ON inst.section_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_require_documents();
+
+-- ---------- Required inputs answered ----------
+CREATE OR REPLACE FUNCTION inst.fn_require_inputs()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_missing TEXT[]; v_code TEXT;
+BEGIN
+  IF NEW.state NOT IN ('ready_for_review','complete') THEN RETURN NEW; END IF;
+
+  SELECT s.section_code INTO v_code FROM inst.section s WHERE s.section_id = NEW.section_id;
+
+  SELECT array_agg(i.input_code) INTO v_missing
+    FROM inst.input i
+    LEFT JOIN inst.input_response ir
+      ON ir.input_id = i.input_id AND ir.section_response_id = NEW.section_response_id
+   WHERE i.section_id = NEW.section_id
+     AND i.is_required
+     AND i.record_status = 'active'
+     AND (ir.input_response_id IS NULL OR ir.value_json IS NULL
+          OR ir.value_json->>'v' IS NULL OR ir.value_json->>'v' = '');
+
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION 'Section % is missing required inputs: %', v_code, array_to_string(v_missing, ', ');
+  END IF;
+
+  IF NEW.state = 'ready_for_review' THEN
+    IF EXISTS (SELECT 1 FROM inst.section s
+                WHERE s.section_id = NEW.section_id
+                  AND s.requires_narrative AND coalesce(trim(NEW.narrative),'') = '') THEN
+      RAISE EXCEPTION 'Section % requires a narrative before review.', v_code;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_inst_require_inputs
+  BEFORE UPDATE ON inst.section_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_require_inputs();
+
+-- ---------- Risk scoring ----------
+CREATE OR REPLACE FUNCTION inst.fn_score_input()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_rule JSONB; v_weight NUMERIC; v_val TEXT; v_score NUMERIC := 0;
+BEGIN
+  SELECT i.risk_rule, i.risk_weight INTO v_rule, v_weight
+    FROM inst.input i WHERE i.input_id = NEW.input_id;
+
+  IF v_rule IS NULL OR v_weight = 0 THEN
+    NEW.computed_risk := 0; RETURN NEW;
+  END IF;
+
+  v_val := NEW.value_json ->> 'v';
+
+  CASE v_rule ->> 'type'
+    WHEN 'map' THEN
+      v_score := COALESCE((v_rule -> 'map' ->> v_val)::numeric, 0);
+    WHEN 'boolean' THEN
+      v_score := CASE WHEN v_val = 'true'
+                      THEN COALESCE((v_rule ->> 'score_if_true')::numeric, 0)
+                      ELSE COALESCE((v_rule ->> 'score_if_false')::numeric, 0) END;
+    WHEN 'threshold' THEN
+      v_score := CASE
+        WHEN (v_rule ? 'gt') AND v_val::numeric >  (v_rule ->> 'gt')::numeric
+          THEN (v_rule ->> 'score')::numeric
+        WHEN (v_rule ? 'lt') AND v_val::numeric <  (v_rule ->> 'lt')::numeric
+          THEN (v_rule ->> 'score')::numeric
+        ELSE 0 END;
+    WHEN 'scale_inverse' THEN
+      v_score := 5 - COALESCE(v_val::numeric, 5);
+    ELSE v_score := 0;
+  END CASE;
+
+  NEW.computed_risk := v_score * v_weight;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_score_input
+  BEFORE INSERT OR UPDATE ON inst.input_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_score_input();
+
+-- ---------- Roll section score + auto-generate findings ----------
+CREATE OR REPLACE FUNCTION inst.fn_roll_section_score()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_total NUMERIC; v_sr UUID; v_trigger JSONB; v_tmpl TEXT; v_val TEXT;
+        v_admin UUID; v_code TEXT; v_fire BOOLEAN := false;
+BEGIN
+  v_sr := NEW.section_response_id;
+
+  SELECT COALESCE(sum(computed_risk), 0) INTO v_total
+    FROM inst.input_response WHERE section_response_id = v_sr AND record_status = 'active';
+
+  UPDATE inst.section_response SET section_risk_score = v_total WHERE section_response_id = v_sr;
+
+  -- Auto-finding
+  SELECT i.triggers_finding_when, i.finding_template, i.input_code
+    INTO v_trigger, v_tmpl, v_code
+    FROM inst.input i WHERE i.input_id = NEW.input_id;
+
+  IF v_trigger IS NOT NULL AND v_tmpl IS NOT NULL THEN
+    v_val := NEW.value_json ->> 'v';
+    v_fire := CASE v_trigger ->> 'op'
+      WHEN 'eq'  THEN v_val = (v_trigger ->> 'value')
+      WHEN 'neq' THEN v_val <> (v_trigger ->> 'value')
+      WHEN 'lt'  THEN v_val::numeric <  (v_trigger ->> 'value')::numeric
+      WHEN 'gt'  THEN v_val::numeric >  (v_trigger ->> 'value')::numeric
+      WHEN 'in'  THEN v_trigger -> 'value' ? v_val
+      ELSE false END;
+
+    IF v_fire THEN
+      SELECT sr.administration_id INTO v_admin
+        FROM inst.section_response sr WHERE sr.section_response_id = v_sr;
+
+      INSERT INTO inst.finding (
+        administration_id, section_response_id, finding_number, title,
+        condition, criteria, recommendation, severity, rating, auto_generated, status)
+      SELECT v_admin, v_sr,
+             'F-' || lpad((SELECT count(*)+1 FROM inst.finding
+                            WHERE administration_id = v_admin)::text, 3, '0'),
+             v_tmpl,
+             'Auto-detected from response to ' || v_code || ': ' || COALESCE(v_val,'(blank)'),
+             COALESCE(s.review_criteria, 'See section criteria'),
+             'Pending assessor recommendation.',
+             'moderate', 'deficient', true, 'draft'
+        FROM inst.section s
+        JOIN inst.section_response sr ON sr.section_id = s.section_id
+       WHERE sr.section_response_id = v_sr
+      ON CONFLICT DO NOTHING;
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER trg_roll_section_score
+  AFTER INSERT OR UPDATE ON inst.input_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_roll_section_score();
+
+-- ---------- Administration rollup ----------
+CREATE OR REPLACE FUNCTION inst.fn_roll_administration(p_admin UUID)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE v_pct NUMERIC; v_risk NUMERIC; v_mat NUMERIC; v_rating frame.exam_rating;
+BEGIN
+  SELECT
+    round(100.0 * count(*) FILTER (WHERE sr.state IN ('complete','not_applicable'))
+          / NULLIF(count(*), 0), 2),
+    COALESCE(sum(sr.section_risk_score * s.weight), 0),
+    round(sum(sr.maturity_level * s.weight) FILTER (WHERE sr.maturity_level IS NOT NULL)
+          / NULLIF(sum(s.weight) FILTER (WHERE sr.maturity_level IS NOT NULL), 0), 2)
+  INTO v_pct, v_risk, v_mat
+  FROM inst.section_response sr
+  JOIN inst.section s ON s.section_id = sr.section_id
+  WHERE sr.administration_id = p_admin AND sr.record_status = 'active';
+
+  -- Worst key-section rating drives the overall
+  SELECT max(sr.rating::text)::frame.exam_rating INTO v_rating
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.administration_id = p_admin AND s.is_key_section AND sr.rating IS NOT NULL;
+
+  UPDATE inst.administration
+     SET completion_pct = COALESCE(v_pct, 0),
+         risk_score = v_risk,
+         maturity_score = v_mat,
+         overall_rating = COALESCE(v_rating, overall_rating),
+         updated_at = now()
+   WHERE administration_id = p_admin;
+END $$;
+
+-- ---------- Materialize an instrument onto an engagement ----------
+CREATE OR REPLACE FUNCTION inst.fn_instantiate(
+  p_engagement UUID, p_instrument UUID, p_party UUID,
+  p_period_start DATE, p_period_end DATE, p_lead UUID)
+RETURNS UUID LANGUAGE plpgsql AS $$
+DECLARE v_admin UUID; v_tenant UUID; v_code TEXT;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM inst.instrument
+                  WHERE instrument_id = p_instrument AND is_published) THEN
+    RAISE EXCEPTION 'Instrument is not published; cannot be administered.';
+  END IF;
+
+  SELECT tenant_id INTO v_tenant FROM engage.engagement WHERE engagement_id = p_engagement;
+  SELECT instrument_code INTO v_code FROM inst.instrument WHERE instrument_id = p_instrument;
+
+  INSERT INTO inst.administration (
+    tenant_id, engagement_id, instrument_id, party_id, admin_number,
+    period_start, period_end, lead_assessor, status)
+  VALUES (v_tenant, p_engagement, p_instrument, p_party,
+    v_code || '-' || to_char(now(),'YYYY') || '-' ||
+      lpad(nextval('inst.seq_admin')::text, 4, '0'),
+    p_period_start, p_period_end, p_lead, 'planning')
+  RETURNING administration_id INTO v_admin;
+
+  -- Every section gets a response shell
+  INSERT INTO inst.section_response (administration_id, section_id, state)
+  SELECT v_admin, s.section_id, 'not_started'
+    FROM inst.section s
+   WHERE s.instrument_id = p_instrument AND s.record_status = 'active';
+
+  -- Every mandatory doc requirement becomes an open request
+  INSERT INTO inst.document_collection (
+    administration_id, requirement_id, section_response_id,
+    requested_from, due_date, status)
+  SELECT v_admin, dr.requirement_id, sr.section_response_id, p_party,
+         CURRENT_DATE + COALESCE(dr.lead_time_days, 5), 'requested'
+    FROM inst.document_requirement dr
+    JOIN inst.section s ON s.section_id = dr.section_id
+    JOIN inst.section_response sr
+      ON sr.section_id = s.section_id AND sr.administration_id = v_admin
+   WHERE s.instrument_id = p_instrument AND dr.record_status = 'active';
+
+  RETURN v_admin;
+END $$;
+
+CREATE SEQUENCE IF NOT EXISTS inst.seq_admin;
+```
+
+---
+
+## SECTION 4: TRM™ — A REAL INSTRUMENT
+
+One section, fully specified, so you can see the shape. This is my draft content — treasury governance is your domain and you'll catch what's wrong.
+
+```sql
+-- ============================================================
+-- 33_SEED_TRM
+-- ============================================================
+
+INSERT INTO inst.instrument (
+  framework_id, instrument_code, version, title, purpose, core_question,
+  scope_statement, estimated_days, deliverables, report_template_code)
+SELECT framework_id, 'TRM', 1,
+  'Treasury & Relationship Management Assessment',
+  'Evaluate stewardship of financial resources, banking relationships, liquidity management, and transaction accountability. Treasury is examined as a governance function, not an operational one.',
+  'Are financial resources properly governed?',
+  'Treasury governance, liquidity governance, transaction governance, banking relationship governance, and fraud prevention controls for the period under review.',
+  4,
+  ARRAY['Treasury Governance Assessment','Liquidity Risk Review','Treasury Control Register','Findings & Recommendations'],
+  'TRM_STANDARD_V1'
+FROM frame.framework WHERE framework_code = 'TRM';
+
+-- ---------- SECTION TRM.TG.01 ----------
+INSERT INTO inst.section (
+  instrument_id, domain_id, section_code, title, section_kind, sort_order,
+  purpose, what_we_assess, why_it_matters,
+  review_criteria, criteria_refs, red_flags, good_practice,
+  min_evidence_tier, evidence_guidance, sample_guidance,
+  performed_by_role, client_role_required,
+  requires_narrative, narrative_prompt, requires_conclusion,
+  weight, is_key_section, na_permitted)
+SELECT
+  i.instrument_id, d.domain_id, 'TRM.TG.01',
+  'Treasury Policy & Board Authority', 'inspection', 10,
+  'Determine whether treasury activity operates under documented, board-authorized policy with defined limits and accountability.',
+  'Existence, currency, approval authority, and scope of the treasury policy; whether delegated authority is explicit and bounded.',
+  'Treasury without board-authorized policy means transactions occur outside a defined authority envelope. This is the root cause of most treasury fraud losses and the first thing an examiner asks for.',
+  'The organization maintains a current, board-approved treasury policy that defines permitted instruments, counterparty criteria, concentration limits, delegated authority thresholds, and review cadence. The policy is within its stated review cycle and delegation is traceable to a board resolution.',
+  ARRAY['NIST CSF 2.0 GV.PO-01','COSO Principle 3 (Structure/Authority/Responsibility)','FFIEC Management Handbook'],
+  ARRAY['No written policy — practice governed by custom',
+        'Policy exists but past its review date',
+        'Approved by management, not the board',
+        'Delegated authority stated without dollar limits',
+        'Policy silent on permitted instruments or counterparties',
+        'No evidence of board review in minutes'],
+  'Board-approved policy, reviewed within the last 12 months, with explicit instrument/counterparty/limit definitions and a delegation matrix traceable to a resolution.',
+  'tier_ii',
+  'The policy document is Tier II (client-provided documentary). Board minutes evidencing approval are Tier II. Independent confirmation from the corporate secretary elevates to Tier I.',
+  'Full population — there is one policy. Review the current version plus the two prior versions to assess amendment discipline.',
+  'ASSESSOR', 'Treasurer or CFO',
+  true,
+  'Describe the policy''s scope, approval provenance, and whether delegated authority is bounded. Note any gap between written policy and observed practice.',
+  true,
+  2.0, true, false
+FROM inst.instrument i
+JOIN frame.framework f ON f.framework_id = i.framework_id
+JOIN frame.domain d ON d.framework_id = f.framework_id AND d.domain_code = 'TG'
+WHERE i.instrument_code = 'TRM' AND i.version = 1;
+
+-- ---------- DOCUMENT MANIFEST ----------
+INSERT INTO inst.document_requirement (
+  section_id, req_code, sort_order, document_name, description, doc_type,
+  format_expected, period_covered, is_mandatory, alternatives_accepted,
+  review_checklist, acceptance_criteria, common_deficiencies,
+  evidence_tier, requested_from_role, lead_time_days)
+SELECT s.section_id, v.code, v.ord, v.name, v.descr, v.dtype, v.fmt, v.period,
+       v.mand, v.alt, v.checklist, v.accept, v.defic, v.tier::frame.evidence_tier, v.role, v.lead
+FROM inst.section s,
+(VALUES
+ ('TRM.TG.01.D1', 1, 'Treasury Policy',
+  'Current effective treasury policy in full, including all appendices, schedules, and the delegation of authority matrix.',
+  'policy', 'PDF — signed/approved version, not a draft', 'Current effective version plus two prior versions',
+  true, 'If no standalone treasury policy exists, provide the finance policy sections addressing cash, investments, and banking, plus any board resolutions establishing authority.',
+  ARRAY['Is the document board-approved (not management-approved)?',
+        'Is the approval date within the stated review cycle?',
+        'Does it define permitted investment instruments?',
+        'Does it define counterparty eligibility criteria?',
+        'Does it state concentration limits (by instrument, counterparty, tenor)?',
+        'Does it include a delegation of authority matrix with dollar thresholds?',
+        'Does it specify a review frequency?',
+        'Is the version/effective date on the face of the document?'],
+  'Accepted when board approval is evidenced on the document face or in accompanying minutes, and all eight checklist items resolve affirmatively or the gap is documented as a finding.',
+  ARRAY['Undated or unversioned','Draft watermark','Approved by CFO alone','Delegation described in prose without limits','Review cycle stated but last review overdue'],
+  'tier_ii', 'Treasurer', 5),
+
+ ('TRM.TG.01.D2', 2, 'Board Minutes Evidencing Approval',
+  'Minutes of the board or authorized committee meeting at which the current treasury policy was approved, plus minutes of the most recent policy review.',
+  'evidence', 'PDF — signed/attested minutes', 'Approval meeting + most recent review meeting',
+  true, 'A certified board resolution or written consent in lieu of meeting is acceptable.',
+  ARRAY['Do the minutes name the treasury policy specifically?',
+        'Is a quorum evidenced?',
+        'Is the approval recorded as a formal vote or resolution?',
+        'Are the minutes signed or attested by the secretary?',
+        'Does the approval date match the policy''s effective date?'],
+  'Accepted when the minutes unambiguously record approval of the identified policy version by a quorate board.',
+  ARRAY['Minutes reference "financial policies" generically','Unsigned draft minutes','Approval date inconsistent with policy face','No quorum recorded'],
+  'tier_ii', 'Corporate Secretary', 7),
+
+ ('TRM.TG.01.D3', 3, 'Delegation of Authority Matrix',
+  'Current DOA matrix showing who may initiate, approve, and release treasury transactions, at what dollar thresholds, and under what conditions.',
+  'policy', 'PDF or spreadsheet — approved version', 'Current',
+  true, 'If embedded in the treasury policy, note that and provide the page reference.',
+  ARRAY['Are dollar thresholds explicit for each authority level?',
+        'Are initiator and approver roles segregated?',
+        'Is a release/second-approval step defined above a threshold?',
+        'Are named individuals or positions identified?',
+        'Is there a documented process for temporary delegation?'],
+  'Accepted when thresholds are explicit and initiation is segregated from approval at every tier.',
+  ARRAY['Same role initiates and approves','Thresholds described as "material" without amounts','No temporary delegation process','Names rather than positions (stale on turnover)'],
+  'tier_ii', 'Treasurer', 5),
+
+ ('TRM.TG.01.D4', 4, 'Prior Policy Versions',
+  'The two treasury policy versions immediately preceding the current one, to assess amendment discipline and change control.',
+  'policy', 'PDF', 'Prior two versions',
+  false, 'If the current policy is the first formal version, state that and provide the date of adoption.',
+  ARRAY['Is each prior version dated and versioned?',
+        'Can the change history be reconstructed?',
+        'Was each amendment board-approved?'],
+  'Informational. Accepted as provided; absence is noted, not a finding, unless the current policy claims a revision history that cannot be substantiated.',
+  ARRAY['No version history maintained','Amendments made without re-approval'],
+  'tier_iii', 'Treasurer', 7)
+) AS v(code, ord, name, descr, dtype, fmt, period, mand, alt, checklist, accept, defic, tier, role, lead)
+WHERE s.section_code = 'TRM.TG.01';
+
+-- ---------- INPUTS ----------
+INSERT INTO inst.input (
+  section_id, input_code, sort_order, label, help_text, assessor_guidance,
+  input_kind, is_required, answered_by, options, risk_weight, risk_rule,
+  triggers_finding_when, finding_template, requires_note_when)
+SELECT s.section_id, v.code, v.ord, v.label, v.help, v.guid, v.kind::inst.input_kind,
+       v.req, v.by, v.opts, v.rw, v.rule, v.trig, v.tmpl, v.note
+FROM inst.section s,
+(VALUES
+ ('TRM.TG.01.Q1', 10, 'Does a written treasury policy exist?',
+  'A standalone policy, or clearly delineated treasury sections within a broader finance policy.',
+  'Do not accept a verbal description of practice. If nothing written exists, this is a critical finding regardless of how well the function operates.',
+  'yes_no_na', true, 'assessor',
+  '[{"value":"yes","label":"Yes — standalone policy"},{"value":"partial","label":"Partial — treasury addressed within another policy"},{"value":"no","label":"No written policy"}]'::jsonb,
+  3.0, '{"type":"map","map":{"no":5,"partial":2,"yes":0}}'::jsonb,
+  '{"op":"eq","value":"no"}'::jsonb,
+  'No written treasury policy — treasury activity operates without a defined authority envelope',
+  '{"op":"eq","value":"partial"}'::jsonb),
+
+ ('TRM.TG.01.Q2', 20, 'At what level was the policy approved?',
+  NULL,
+  'Board or board committee is the standard. Management approval of a treasury policy is a governance defect — management cannot authorize its own limits.',
+  'single_select', true, 'assessor',
+  '[{"value":"board","label":"Board of Directors"},{"value":"committee","label":"Board committee with delegated authority"},{"value":"management","label":"Management only"},{"value":"none","label":"No documented approval"}]'::jsonb,
+  3.0, '{"type":"map","map":{"none":5,"management":4,"committee":1,"board":0}}'::jsonb,
+  '{"op":"in","value":["management","none"]}'::jsonb,
+  'Treasury policy lacks board-level approval',
+  NULL),
+
+ ('TRM.TG.01.Q3', 30, 'Policy effective date',
+  'The effective date shown on the face of the current policy.',
+  'Cross-check against the board minutes. A mismatch between the policy face and the approval record is itself a finding.',
+  'date', true, 'assessor', NULL, 0, NULL, NULL, NULL, NULL),
+
+ ('TRM.TG.01.Q4', 40, 'Stated review frequency (months)',
+  NULL, 'Twelve months is the common standard. Longer cycles require justification.',
+  'number', true, 'assessor', NULL,
+  1.5, '{"type":"threshold","gt":24,"score":3}'::jsonb, NULL, NULL, NULL),
+
+ ('TRM.TG.01.Q5', 50, 'Date of most recent documented review',
+  NULL, 'Must be evidenced in minutes, not asserted in interview.',
+  'date', false, 'assessor', NULL, 0, NULL, NULL, NULL, NULL),
+
+ ('TRM.TG.01.Q6', 60, 'Is the policy currently within its review cycle?',
+  'Computed from Q3, Q4, Q5 — confirm or override with rationale.',
+  'If overdue, determine how long. A policy two cycles overdue suggests the governance calendar itself is not operating.',
+  'yes_no_na', true, 'assessor',
+  '[{"value":"yes","label":"Within cycle"},{"value":"no","label":"Overdue"},{"value":"na","label":"Not determinable"}]'::jsonb,
+  2.0, '{"type":"map","map":{"no":4,"na":3,"yes":0}}'::jsonb,
+  '{"op":"eq","value":"no"}'::jsonb,
+  'Treasury policy is past its stated review date',
+  NULL),
+
+ ('TRM.TG.01.Q7', 70, 'Which elements does the policy define?',
+  'Select all that are explicitly addressed.',
+  'Read for substance, not headings. A section titled "Concentration Limits" with no numbers is not a definition.',
+  'multi_select', true, 'assessor',
+  '[{"value":"instruments","label":"Permitted instruments"},{"value":"counterparties","label":"Counterparty eligibility criteria"},{"value":"concentration","label":"Concentration limits"},{"value":"tenor","label":"Maturity/tenor limits"},{"value":"delegation","label":"Delegation of authority with thresholds"},{"value":"segregation","label":"Segregation of duties requirements"},{"value":"reporting","label":"Reporting requirements to the board"},{"value":"exceptions","label":"Exception/escalation process"}]'::jsonb,
+  0, NULL, NULL, NULL, NULL),
+
+ ('TRM.TG.01.Q8', 80, 'Delegated authority thresholds',
+  'Record each authority tier from the DOA matrix.',
+  'Look specifically for whether initiation and approval are segregated at every tier, and whether a release step exists above a threshold.',
+  'table_grid', true, 'assessor', NULL, 0, NULL, NULL, NULL, NULL),
+
+ ('TRM.TG.01.Q9', 90, 'Does observed practice align with written policy?',
+  'Based on inquiry and any transactions inspected in this section.',
+  'This is the question that separates a document review from an audit. A perfect policy that nobody follows rates worse than a modest policy that governs actual behavior.',
+  'single_select', true, 'assessor',
+  '[{"value":"aligned","label":"Aligned"},{"value":"minor","label":"Minor deviations"},{"value":"material","label":"Material deviation"},{"value":"undetermined","label":"Not determinable at this stage"}]'::jsonb,
+  3.0, '{"type":"map","map":{"material":5,"minor":2,"undetermined":2,"aligned":0}}'::jsonb,
+  '{"op":"eq","value":"material"}'::jsonb,
+  'Observed treasury practice deviates materially from written policy',
+  '{"op":"in","value":["minor","material","undetermined"]}'::jsonb),
+
+ ('TRM.TG.01.Q10', 100, 'Design effectiveness rating',
+  NULL, 'Rate the policy as designed, independent of whether it operates. Operational effectiveness is assessed in TRM.TG.02.',
+  'single_select', true, 'assessor',
+  '[{"value":"effective","label":"Effective"},{"value":"partially_effective","label":"Partially Effective"},{"value":"deficient","label":"Deficient"},{"value":"critical_exposure","label":"Critical Exposure"}]'::jsonb,
+  0, NULL, NULL, NULL, NULL)
+) AS v(code, ord, label, help, guid, kind, req, by, opts, rw, rule, trig, tmpl, note)
+WHERE s.section_code = 'TRM.TG.01';
+
+-- Grid definition for Q8
+UPDATE inst.input SET grid_columns = '[
+  {"key":"tier","label":"Authority Tier","kind":"short_text","required":true},
+  {"key":"role","label":"Role/Position","kind":"short_text","required":true},
+  {"key":"can_initiate","label":"May Initiate","kind":"boolean"},
+  {"key":"can_approve","label":"May Approve","kind":"boolean"},
+  {"key":"can_release","label":"May Release","kind":"boolean"},
+  {"key":"limit_amount","label":"Limit (USD)","kind":"currency"},
+  {"key":"second_approval","label":"Second Approval Required Above","kind":"currency"},
+  {"key":"segregated","label":"Initiate/Approve Segregated?","kind":"boolean"}
+]'::jsonb, grid_min_rows = 1
+WHERE input_code = 'TRM.TG.01.Q8';
+```
+
+---
+
+## WHAT YOU'RE LOOKING AT
+
+That one section carries: purpose, what's assessed, why it matters, review criteria with framework references, six red flags, a good-practice definition, an evidence tier bar, sampling guidance, four document requirements each with their own review checklist and common-deficiency list, ten inputs with assessor guidance, risk weights, auto-finding triggers, and a grid. It's a real workpaper.
+
+TRM has five domains. At roughly 3–5 sections per domain, that's ~20 sections × this depth. Then four more frameworks.
+
+**Two things before I keep going:**
+
+1. **Look at TRM.TG.01 and tell me where I'm wrong.** You're a CTP — the treasury content is the part you'll see through instantly. Is the review criteria right? Are the red flags the real ones? Is "board approval" the right bar, or do your clients' structures make that unrealistic?
+
+2. **The content problem is now unavoidable.** I can build all 20 TRM sections at this depth from treasury practice. But GRC-A, REG-C, ICAEF, and TrustFabric are *your* frameworks — their objectives and exam points aren't inferable from an infographic with garbled text. If I draft them, you're auditing clients against controls I invented. Paste even rough bullets per domain and they become real.
+
+Next: the report generator (`inst.administration` → Treasury Control Register + Liquidity Risk Review as actual PDF), the Next.js fieldwork UI, or the remaining TRM sections?
