@@ -1,0 +1,193 @@
+# docker-compose.yml
+name: intune-erp
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: intune-pg
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_DB: intune
+      POSTGRES_USER: intune_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_cron,pg_stat_statements
+      -c cron.database_name=intune
+      -c max_connections=200
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=16MB
+      -c maintenance_work_mem=512MB
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='pgbackrest --stanza=intune archive-push %p'
+      -c log_statement=ddl
+      -c log_min_duration_statement=1000
+      -c log_connections=on
+      -c log_disconnections=on
+      -c ssl=on
+      -c ssl_cert_file=/certs/server.crt
+      -c ssl_key_file=/certs/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+      - ./certs:/certs:ro
+    secrets: [pg_password]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U intune_admin -d intune"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: intune-redis
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes: [redisdata:/data]
+    networks: [data]
+    logging: *default-logging
+
+  minio:
+    image: minio/minio:latest
+    container_name: intune-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_SERVER_URL: https://files.trustintune.com
+    volumes: [miniodata:/data]
+    networks: [data, app]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+    logging: *default-logging
+
+  nocobase:
+    image: nocobase/nocobase:latest
+    container_name: intune-nocobase
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB_DIALECT: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: intune
+      DB_USER: nocobase_app
+      DB_PASSWORD: ${NOCOBASE_DB_PASSWORD}
+      DB_UNDERSCORED: "true"
+      APP_KEY: ${NOCOBASE_APP_KEY}
+      APP_PORT: 13000
+      ENCRYPTION_FIELD_KEY: ${NOCOBASE_ENC_KEY}
+      LOGGER_LEVEL: info
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    volumes: [nocobase_storage:/app/nocobase/storage]
+    networks: [data, app]
+    logging: *default-logging
+
+  clamav:
+    image: clamav/clamav:latest
+    container_name: intune-clamav
+    restart: unless-stopped
+    volumes: [clamdb:/var/lib/clamav]
+    networks: [app]
+    logging: *default-logging
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: intune-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n_app
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: automation.trustintune.com
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://automation.trustintune.com/
+      GENERIC_TIMEZONE: America/Denver
+      N8N_DIAGNOSTICS_ENABLED: "false"
+    volumes: [n8ndata:/home/node/.n8n]
+    networks: [data, app]
+    logging: *default-logging
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: intune-metabase
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase_app
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_SECRET}
+      JAVA_TIMEZONE: America/Denver
+    networks: [data, app]
+    logging: *default-logging
+
+  pgbackrest:
+    image: pgbackrest/pgbackrest:latest
+    container_name: intune-backup
+    restart: unless-stopped
+    depends_on: [postgres]
+    volumes:
+      - pgdata:/var/lib/postgresql/data:ro
+      - backups:/var/lib/pgbackrest
+      - ./pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    networks: [data]
+    logging: *default-logging
+
+  nginx:
+    image: nginx:alpine
+    container_name: intune-nginx
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on: [nocobase, metabase, n8n]
+    networks: [app]
+    logging: *default-logging
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  nocobase_storage: {}
+  n8ndata: {}
+  clamdb: {}
+  backups: {}
+  nginx_cache: {}
+
+networks:
+  data:
+    internal: true      # no egress — DB tier isolated
+  app:
+    driver: bridge
+
+secrets:
+  pg_password:
+    file: ./secrets/pg_password.txt
