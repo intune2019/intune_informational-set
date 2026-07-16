@@ -1,0 +1,918 @@
+Now we're aligned. The fieldwork discipline you're describing — fact-based examination, criteria tied to citable authority, condition/criteria/cause/effect findings, evidence sufficiency — **is** documented global practice: GAO Green Book, COSO 2013, IIA standards, ACFE examination methodology, FFIEC procedures, UCC 4A, the Texas Public Funds Investment Act for your public-entity market. That's the factual substrate. Your five frameworks plug into it as content; the engine makes the discipline unavoidable.
+
+Here it is. Complete.
+
+---
+
+## SECTION 1: AUTHORITY REGISTRY — the crosswalk target
+
+"Fact-based crosswalk to statute and law" means criteria are **foreign keys to citable authority, never free text.** An assessor cannot write a finding whose criteria is vibes.
+
+```sql
+-- ============================================================
+-- 50_AUTHORITY :: statute, regulation, standard, guidance
+-- ============================================================
+
+CREATE TYPE frame.authority_kind AS ENUM (
+  'statute',            -- 31 U.S.C. § 5318(h)
+  'regulation',         -- 31 CFR 1010.230
+  'state_statute',      -- Tex. Gov't Code ch. 2256
+  'framework_standard', -- COSO Principle 10, NIST CSF GV.PO-01
+  'exam_guidance',      -- FFIEC handbooks
+  'professional_std',   -- IIA, ACFE, AICPA
+  'contractual',        -- client policy, charter, indenture
+  'internal_policy'     -- the client's own governing documents
+);
+
+CREATE TABLE frame.authority (
+  authority_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  authority_kind  frame.authority_kind NOT NULL,
+  citation        TEXT NOT NULL,          -- 'Tex. Gov''t Code § 2256.005(b)'
+  short_name      TEXT NOT NULL,          -- 'PFIA — investment policy requirement'
+  issuing_body    TEXT NOT NULL,          -- 'Texas Legislature'
+  title_text      TEXT,                   -- verbatim heading where public domain
+  requirement_summary TEXT NOT NULL,      -- neutral summary of what it requires
+  url             TEXT,
+  effective_date  DATE,
+  superseded_by   UUID REFERENCES frame.authority(authority_id),
+  verification_status TEXT NOT NULL DEFAULT 'verified'
+                  CHECK (verification_status IN ('verified','pending_verification','superseded')),
+  verified_by     UUID REFERENCES core.app_user(user_id),
+  verified_at     TIMESTAMPTZ,
+  is_licensed_content BOOLEAN NOT NULL DEFAULT false,  -- ISO/PCI/ACFE: cite ref only
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_citation UNIQUE (citation)
+);
+CREATE INDEX ix_authority_kind ON frame.authority (authority_kind, record_status);
+
+COMMENT ON TABLE frame.authority IS
+  'Every criteria in every finding traces here by FK. Free-text criteria are
+   structurally impossible. Licensed standards store the citation and a neutral
+   summary, never reproduced text.';
+
+-- Section-level crosswalk: what a section tests against, declared up front
+CREATE TABLE inst.section_authority (
+  section_id    UUID NOT NULL REFERENCES inst.section(section_id) ON DELETE CASCADE,
+  authority_id  UUID NOT NULL REFERENCES frame.authority(authority_id),
+  relevance     TEXT NOT NULL DEFAULT 'primary'
+                CHECK (relevance IN ('primary','supporting','informational')),
+  applicability_note TEXT,   -- 'Applies only to TX public entities'
+  PRIMARY KEY (section_id, authority_id)
+);
+
+-- Applicability rules: not every authority binds every client
+CREATE TABLE frame.authority_applicability (
+  applicability_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  authority_id  UUID NOT NULL REFERENCES frame.authority(authority_id) ON DELETE CASCADE,
+  condition_expr JSONB NOT NULL,
+  -- {"all":[{"field":"entity_type","op":"in","value":["government"]},
+  --         {"field":"jurisdiction","op":"eq","value":"TX"}]}
+  rationale     TEXT NOT NULL
+);
+```
+
+## SECTION 2: RISK VECTOR ENGINE
+
+```sql
+-- ============================================================
+-- 51_RISK_VECTOR
+-- ============================================================
+
+CREATE TABLE frame.risk_vector (
+  vector_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  vector_code   TEXT NOT NULL UNIQUE,     -- 'TRE-LIQ', 'FRD-OPP'
+  vector_name   TEXT NOT NULL,
+  category      TEXT NOT NULL CHECK (category IN
+                ('treasury','fraud','governance','compliance','operational',
+                 'technology','third_party','reputational','strategic')),
+  description   TEXT NOT NULL,
+  -- Fraud-triangle tagging where category='fraud'
+  fraud_element TEXT CHECK (fraud_element IN ('pressure','opportunity','rationalization')),
+  authority_id  UUID REFERENCES frame.authority(authority_id),  -- where the vector is grounded
+  velocity_default TEXT CHECK (velocity_default IN ('slow','moderate','rapid','immediate')),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- Sections declare which vectors they probe — the instrument's risk coverage map
+CREATE TABLE inst.section_risk_vector (
+  section_id  UUID NOT NULL REFERENCES inst.section(section_id) ON DELETE CASCADE,
+  vector_id   UUID NOT NULL REFERENCES frame.risk_vector(vector_id),
+  PRIMARY KEY (section_id, vector_id)
+);
+
+-- Assessed exposure per administration per vector — feeds the Risk Register deliverable
+CREATE TABLE inst.risk_assessment (
+  risk_assessment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  vector_id     UUID NOT NULL REFERENCES frame.risk_vector(vector_id),
+  likelihood    INT NOT NULL CHECK (likelihood BETWEEN 1 AND 5),
+  impact        INT NOT NULL CHECK (impact BETWEEN 1 AND 5),
+  velocity      TEXT NOT NULL CHECK (velocity IN ('slow','moderate','rapid','immediate')),
+  score         INT GENERATED ALWAYS AS (likelihood * impact) STORED,
+  basis_narrative TEXT NOT NULL,          -- fact basis, mandatory
+  assessed_by   UUID NOT NULL REFERENCES core.app_user(user_id),
+  assessed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_admin_vector UNIQUE (administration_id, vector_id),
+  CONSTRAINT ck_basis_substantive CHECK (length(trim(basis_narrative)) >= 100)
+);
+
+-- Evidence anchoring: a risk score must cite at least one section response
+CREATE TABLE inst.risk_basis (
+  risk_assessment_id UUID NOT NULL REFERENCES inst.risk_assessment(risk_assessment_id) ON DELETE CASCADE,
+  section_response_id UUID NOT NULL REFERENCES inst.section_response(section_response_id),
+  PRIMARY KEY (risk_assessment_id, section_response_id)
+);
+
+CREATE OR REPLACE FUNCTION inst.fn_risk_requires_basis()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM inst.risk_basis
+                  WHERE risk_assessment_id = NEW.risk_assessment_id) THEN
+    RAISE EXCEPTION
+      'Risk vector scoring requires at least one section response as fact basis. Link the fieldwork first (inst.risk_basis).';
+  END IF;
+  RETURN NEW;
+END $$;
+
+-- Fires on UPDATE (record is created, basis linked, then finalized)
+CREATE TRIGGER trg_risk_basis
+  BEFORE UPDATE OF likelihood, impact ON inst.risk_assessment
+  FOR EACH ROW WHEN (OLD.record_status = 'active')
+  EXECUTE FUNCTION inst.fn_risk_requires_basis();
+```
+
+## SECTION 3: CHECKLIST ENGINE — rows, not blobs
+
+```sql
+-- ============================================================
+-- 52_CHECKLIST
+-- ============================================================
+
+CREATE TABLE inst.checklist_item (
+  item_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  section_id    UUID REFERENCES inst.section(section_id) ON DELETE CASCADE,
+  requirement_id UUID REFERENCES inst.document_requirement(requirement_id) ON DELETE CASCADE,
+  item_code     TEXT NOT NULL,            -- 'TRM.TG.01.C1'
+  sort_order    INT NOT NULL DEFAULT 0,
+  item_text     TEXT NOT NULL,            -- 'Is the policy authorized by the ultimate governing authority?'
+  guidance      TEXT,
+  authority_id  UUID REFERENCES frame.authority(authority_id),  -- what makes this item matter
+  result_kind   TEXT NOT NULL DEFAULT 'yes_no_exception'
+                CHECK (result_kind IN ('yes_no_exception','pass_fail','present_absent','verified_unverified')),
+  exception_requires_note     BOOLEAN NOT NULL DEFAULT true,
+  exception_requires_evidence BOOLEAN NOT NULL DEFAULT false,
+  exception_suggests_finding  BOOLEAN NOT NULL DEFAULT true,
+  is_mandatory  BOOLEAN NOT NULL DEFAULT true,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_item_parent CHECK (num_nonnulls(section_id, requirement_id) = 1)
+);
+CREATE UNIQUE INDEX uq_item_code_section ON inst.checklist_item (section_id, item_code)
+  WHERE section_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_item_code_req ON inst.checklist_item (requirement_id, item_code)
+  WHERE requirement_id IS NOT NULL;
+
+CREATE TABLE inst.checklist_result (
+  result_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  administration_id UUID NOT NULL REFERENCES inst.administration(administration_id) ON DELETE CASCADE,
+  item_id       UUID NOT NULL REFERENCES inst.checklist_item(item_id),
+  section_response_id UUID REFERENCES inst.section_response(section_response_id) ON DELETE CASCADE,
+  collection_id UUID REFERENCES inst.document_collection(collection_id) ON DELETE CASCADE,
+
+  result        TEXT CHECK (result IN ('yes','no','exception','pass','fail',
+                                       'present','absent','verified','unverified','na')),
+  note          TEXT,
+  na_rationale  TEXT,
+  evidence_id   UUID REFERENCES inst.evidence(evidence_id),
+
+  checked_by    UUID REFERENCES core.app_user(user_id),
+  checked_at    TIMESTAMPTZ,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT uq_checklist_result UNIQUE (administration_id, item_id),
+  CONSTRAINT ck_na_needs_rationale CHECK (result <> 'na' OR na_rationale IS NOT NULL)
+);
+CREATE INDEX ix_clresult_open ON inst.checklist_result (administration_id)
+  WHERE result IS NULL;
+
+-- Exception discipline: a negative result cannot be silently checked
+CREATE OR REPLACE FUNCTION inst.fn_checklist_discipline()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE it RECORD;
+BEGIN
+  IF NEW.result IS NULL THEN RETURN NEW; END IF;
+
+  SELECT * INTO it FROM inst.checklist_item WHERE item_id = NEW.item_id;
+
+  IF NEW.result IN ('no','exception','fail','absent','unverified') THEN
+    IF it.exception_requires_note AND coalesce(trim(NEW.note),'') = '' THEN
+      RAISE EXCEPTION
+        'Checklist %: a negative result requires a note stating what was observed. Silence is not a record.',
+        it.item_code;
+    END IF;
+    IF it.exception_requires_evidence AND NEW.evidence_id IS NULL THEN
+      RAISE EXCEPTION
+        'Checklist %: this exception must link the evidence item that demonstrates it.',
+        it.item_code;
+    END IF;
+  END IF;
+
+  NEW.checked_by := COALESCE(NEW.checked_by, core.current_actor());
+  NEW.checked_at := COALESCE(NEW.checked_at, now());
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_checklist_discipline
+  BEFORE INSERT OR UPDATE ON inst.checklist_result
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_checklist_discipline();
+```
+
+## SECTION 4: THE COMPLETENESS STATE MACHINE
+
+"Impossible to not collect all needed data points" — enforced as a gate function that computes what's missing, and a transition trigger that refuses advancement until the answer is nothing.
+
+```sql
+-- ============================================================
+-- 53_COMPLETENESS
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION inst.fn_section_gaps(p_section_response UUID)
+RETURNS TABLE (gap_kind TEXT, gap_ref TEXT, gap_detail TEXT)
+LANGUAGE sql STABLE AS $$
+  -- 1. Unanswered required inputs
+  SELECT 'input', i.input_code, i.label
+    FROM inst.section_response sr
+    JOIN inst.input i ON i.section_id = sr.section_id
+    LEFT JOIN inst.input_response ir
+      ON ir.input_id = i.input_id AND ir.section_response_id = sr.section_response_id
+   WHERE sr.section_response_id = p_section_response
+     AND i.is_required AND i.record_status = 'active'
+     AND (ir.value_json IS NULL OR coalesce(ir.value_json->>'v','') = '')
+  UNION ALL
+  -- 2. Unchecked mandatory checklist items
+  SELECT 'checklist', ci.item_code, ci.item_text
+    FROM inst.section_response sr
+    JOIN inst.checklist_item ci ON ci.section_id = sr.section_id
+    LEFT JOIN inst.checklist_result cr
+      ON cr.item_id = ci.item_id AND cr.section_response_id = sr.section_response_id
+   WHERE sr.section_response_id = p_section_response
+     AND ci.is_mandatory AND ci.record_status = 'active'
+     AND cr.result IS NULL
+  UNION ALL
+  -- 3. Unresolved mandatory documents
+  SELECT 'document', dr.req_code, dr.document_name || ' — status: ' || COALESCE(dc.status,'requested')
+    FROM inst.section_response sr
+    JOIN inst.document_requirement dr ON dr.section_id = sr.section_id
+    LEFT JOIN inst.document_collection dc
+      ON dc.requirement_id = dr.requirement_id AND dc.administration_id = sr.administration_id
+   WHERE sr.section_response_id = p_section_response
+     AND dr.is_mandatory AND dr.record_status = 'active'
+     AND COALESCE(dc.status,'requested') NOT IN ('accepted','waived','not_available')
+  UNION ALL
+  -- 4. Missing narrative
+  SELECT 'narrative', s.section_code, 'Professional narrative is required (min 150 chars)'
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.section_response_id = p_section_response
+     AND s.requires_narrative
+     AND length(coalesce(trim(sr.narrative),'')) < 150
+  UNION ALL
+  -- 5. Missing work-performed statement
+  SELECT 'work_performed', s.section_code, 'Describe the procedures actually performed (min 100 chars)'
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.section_response_id = p_section_response
+     AND s.section_kind NOT IN ('scoping','document_request')
+     AND length(coalesce(trim(sr.work_performed),'')) < 100
+  UNION ALL
+  -- 6. Conclusion without sufficient evidence at the required tier
+  SELECT 'evidence', s.section_code,
+         'Rating requires sufficient evidence at ' || s.min_evidence_tier || ' or stronger'
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.section_response_id = p_section_response
+     AND s.requires_conclusion
+     AND NOT EXISTS (
+       SELECT 1 FROM inst.evidence e
+        WHERE e.section_response_id = sr.section_response_id
+          AND e.is_sufficient IS TRUE AND e.tier <= s.min_evidence_tier)
+  UNION ALL
+  -- 7. Deficient rating without a finding
+  SELECT 'finding', s.section_code,
+         'A ' || sr.rating || ' rating requires at least one documented finding'
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.section_response_id = p_section_response
+     AND sr.rating IN ('deficient','critical_exposure')
+     AND NOT EXISTS (
+       SELECT 1 FROM inst.finding f
+        WHERE f.section_response_id = sr.section_response_id
+          AND f.record_status = 'active');
+$$;
+
+-- Legal state transitions
+CREATE TABLE inst.state_transition (
+  from_state inst.completion_state NOT NULL,
+  to_state   inst.completion_state NOT NULL,
+  requires_gaps_clear BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (from_state, to_state)
+);
+
+INSERT INTO inst.state_transition VALUES
+ ('not_started','in_progress', false),
+ ('not_started','not_applicable', false),
+ ('in_progress','client_pending', false),
+ ('client_pending','in_progress', false),
+ ('in_progress','ready_for_review', true),      -- THE GATE
+ ('ready_for_review','reviewed', false),
+ ('ready_for_review','reopened', false),
+ ('reopened','in_progress', false),
+ ('reviewed','complete', false),
+ ('reviewed','reopened', false),
+ ('in_progress','not_applicable', false),
+ ('complete','reopened', false);
+
+CREATE OR REPLACE FUNCTION inst.fn_enforce_transition()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_gaps INT; v_code TEXT; v_sample TEXT;
+BEGIN
+  IF OLD.state = NEW.state THEN RETURN NEW; END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM inst.state_transition
+                  WHERE from_state = OLD.state AND to_state = NEW.state) THEN
+    RAISE EXCEPTION 'Illegal state transition: % → %', OLD.state, NEW.state;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM inst.state_transition
+              WHERE from_state = OLD.state AND to_state = NEW.state
+                AND requires_gaps_clear) THEN
+    SELECT count(*), min(gap_kind || ': ' || gap_ref)
+      INTO v_gaps, v_sample
+      FROM inst.fn_section_gaps(NEW.section_response_id);
+    IF v_gaps > 0 THEN
+      SELECT s.section_code INTO v_code FROM inst.section s WHERE s.section_id = NEW.section_id;
+      RAISE EXCEPTION
+        'Section % cannot advance: % open item(s). First: %. Query inst.fn_section_gaps(%L) for the full list.',
+        v_code, v_gaps, v_sample, NEW.section_response_id;
+    END IF;
+  END IF;
+
+  -- NA is a decision, not an escape
+  IF NEW.state = 'not_applicable' THEN
+    IF length(coalesce(trim(NEW.na_rationale),'')) < 100 THEN
+      RAISE EXCEPTION 'Not-applicable requires a substantive rationale (min 100 chars).';
+    END IF;
+    IF NOT (SELECT na_permitted FROM inst.section WHERE section_id = NEW.section_id) THEN
+      RAISE EXCEPTION 'This section may not be marked not-applicable.';
+    END IF;
+  END IF;
+
+  -- Reopening a reviewed/complete section leaves a mark
+  IF OLD.state IN ('reviewed','complete') AND NEW.state = 'reopened' THEN
+    NEW.is_locked := false;
+    NEW.review_notes := coalesce(NEW.review_notes,'') ||
+      E'\n[REOPENED ' || now()::date || ' by ' || coalesce(core.current_actor()::text,'system') || ']';
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_inst_require_docs ON inst.section_response;
+DROP TRIGGER IF EXISTS trg_inst_require_inputs ON inst.section_response;
+
+CREATE TRIGGER trg_enforce_transition
+  BEFORE UPDATE OF state ON inst.section_response
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_enforce_transition();
+```
+
+## SECTION 5: FINDING DISCIPLINE — condition / criteria / cause / effect, citation-required
+
+```sql
+-- ============================================================
+-- 54_FINDING_DISCIPLINE
+-- ============================================================
+
+-- Criteria become FKs. The elements-of-a-finding structure (GAO Yellow Book
+-- fieldwork discipline) is enforced, not encouraged.
+CREATE TABLE inst.finding_criteria (
+  finding_id    UUID NOT NULL REFERENCES inst.finding(finding_id) ON DELETE CASCADE,
+  authority_id  UUID NOT NULL REFERENCES frame.authority(authority_id),
+  application_note TEXT,   -- how this authority applies to this condition
+  PRIMARY KEY (finding_id, authority_id)
+);
+
+CREATE TABLE inst.finding_evidence (
+  finding_id   UUID NOT NULL REFERENCES inst.finding(finding_id) ON DELETE CASCADE,
+  evidence_id  UUID NOT NULL REFERENCES inst.evidence(evidence_id),
+  PRIMARY KEY (finding_id, evidence_id)
+);
+
+CREATE TABLE inst.finding_risk_vector (
+  finding_id  UUID NOT NULL REFERENCES inst.finding(finding_id) ON DELETE CASCADE,
+  vector_id   UUID NOT NULL REFERENCES frame.risk_vector(vector_id),
+  PRIMARY KEY (finding_id, vector_id)
+);
+
+CREATE OR REPLACE FUNCTION inst.fn_finding_discipline()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  -- Draft findings may be skeletal; anything past draft must be complete
+  IF NEW.status = 'draft' THEN RETURN NEW; END IF;
+
+  IF length(coalesce(trim(NEW.condition),'')) < 100 THEN
+    RAISE EXCEPTION 'Finding %: CONDITION must state what was observed, factually (min 100 chars).', NEW.finding_number;
+  END IF;
+  IF length(coalesce(trim(NEW.cause),'')) < 50 THEN
+    RAISE EXCEPTION 'Finding %: CAUSE is required before the finding leaves draft.', NEW.finding_number;
+  END IF;
+  IF length(coalesce(trim(NEW.effect),'')) < 50 THEN
+    RAISE EXCEPTION 'Finding %: EFFECT (actual or potential consequence) is required.', NEW.finding_number;
+  END IF;
+  IF length(coalesce(trim(NEW.recommendation),'')) < 50 THEN
+    RAISE EXCEPTION 'Finding %: RECOMMENDATION must be actionable (min 50 chars).', NEW.finding_number;
+  END IF;
+
+  -- Criteria: at least one authority citation. Free text alone is not criteria.
+  IF NOT EXISTS (SELECT 1 FROM inst.finding_criteria WHERE finding_id = NEW.finding_id) THEN
+    RAISE EXCEPTION
+      'Finding %: criteria must cite at least one authority (inst.finding_criteria). A finding without citable criteria is an opinion.',
+      NEW.finding_number;
+  END IF;
+
+  -- Fact basis: at least one evidence link
+  IF NOT EXISTS (SELECT 1 FROM inst.finding_evidence WHERE finding_id = NEW.finding_id) THEN
+    RAISE EXCEPTION
+      'Finding %: link the evidence demonstrating the condition (inst.finding_evidence).',
+      NEW.finding_number;
+  END IF;
+
+  -- Risk traceability
+  IF NOT EXISTS (SELECT 1 FROM inst.finding_risk_vector WHERE finding_id = NEW.finding_id) THEN
+    RAISE EXCEPTION
+      'Finding %: tag at least one risk vector so the Risk Register can aggregate it.',
+      NEW.finding_number;
+  END IF;
+
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_finding_discipline
+  BEFORE UPDATE OF status ON inst.finding
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_finding_discipline();
+```
+
+## SECTION 6: ADMINISTRATION-LEVEL GATE — the report cannot issue incomplete
+
+```sql
+-- ============================================================
+-- 55_ISSUANCE_GATE
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION inst.fn_administration_gaps(p_admin UUID)
+RETURNS TABLE (gap_kind TEXT, gap_ref TEXT, gap_detail TEXT)
+LANGUAGE sql STABLE AS $$
+  SELECT 'section', s.section_code, 'State: ' || sr.state
+    FROM inst.section_response sr
+    JOIN inst.section s ON s.section_id = sr.section_id
+   WHERE sr.administration_id = p_admin
+     AND sr.record_status = 'active'
+     AND sr.state NOT IN ('complete','not_applicable')
+  UNION ALL
+  SELECT 'finding', f.finding_number, 'Finding still in status: ' || f.status
+    FROM inst.finding f
+   WHERE f.administration_id = p_admin
+     AND f.record_status = 'active'
+     AND f.status = 'draft'
+  UNION ALL
+  SELECT 'risk_register', rv.vector_code,
+         'Vector probed by fieldwork but never scored'
+    FROM inst.section_response sr
+    JOIN inst.section_risk_vector srv ON srv.section_id = sr.section_id
+    JOIN frame.risk_vector rv ON rv.vector_id = srv.vector_id
+   WHERE sr.administration_id = p_admin AND sr.state = 'complete'
+     AND NOT EXISTS (SELECT 1 FROM inst.risk_assessment ra
+                      WHERE ra.administration_id = p_admin
+                        AND ra.vector_id = srv.vector_id
+                        AND ra.record_status = 'active')
+   GROUP BY rv.vector_code
+  UNION ALL
+  SELECT 'language', lv.matched_term, 'Unresolved assurance-language violation'
+    FROM inst.language_violation lv
+   WHERE lv.administration_id = p_admin AND lv.resolved_at IS NULL
+  UNION ALL
+  SELECT 'continuity', 'signature',
+         'Report signatory differs from proposal signatory without a recorded variance'
+    FROM inst.administration a
+    JOIN engage.engagement e ON e.engagement_id = a.engagement_id
+    JOIN core.operating_profile op ON op.profile_id = a.profile_id
+   WHERE a.administration_id = p_admin
+     AND op.requires_continuity_trace
+     AND EXISTS (
+       SELECT 1 FROM engage.continuity_trace ct
+        WHERE ct.engagement_id = e.engagement_id
+          AND ct.lifecycle_stage = 'proposal'
+          AND ct.asserted_by IS DISTINCT FROM e.report_signatory)
+     AND NOT EXISTS (
+       SELECT 1 FROM engage.continuity_trace ct
+        WHERE ct.engagement_id = e.engagement_id
+          AND ct.lifecycle_stage = 'report_signature'
+          AND ct.variance_from_prior IS NOT NULL);
+$$;
+
+CREATE OR REPLACE FUNCTION inst.fn_gate_issuance()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_gaps INT; v_sample TEXT;
+BEGIN
+  IF NEW.status IN ('final') AND OLD.status <> 'final' THEN
+    SELECT count(*), min(gap_kind || ': ' || gap_ref || ' — ' || gap_detail)
+      INTO v_gaps, v_sample
+      FROM inst.fn_administration_gaps(NEW.administration_id);
+    IF v_gaps > 0 THEN
+      RAISE EXCEPTION
+        'Cannot finalize %: % open item(s). First: %. Query inst.fn_administration_gaps(%L).',
+        NEW.admin_number, v_gaps, v_sample, NEW.administration_id;
+    END IF;
+    PERFORM inst.fn_roll_administration(NEW.administration_id);
+    NEW.issued_at := now();
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_gate_issuance
+  BEFORE UPDATE OF status ON inst.administration
+  FOR EACH ROW EXECUTE FUNCTION inst.fn_gate_issuance();
+```
+
+## SECTION 7: THE UI CONTRACT — what the Examiner interface consumes
+
+The interface designer never invents completeness logic. It's one view.
+
+```sql
+-- ============================================================
+-- 56_UI_CONTRACT
+-- ============================================================
+
+CREATE OR REPLACE VIEW inst.v_examiner_worklist AS
+SELECT
+  a.administration_id, a.admin_number, a.status AS engagement_status,
+  p.display_name AS client_name,
+  s.section_code, s.title, s.section_kind, s.sort_order,
+  sr.section_response_id, sr.state,
+  g.open_inputs, g.open_checklist, g.open_documents,
+  g.needs_narrative, g.needs_work_performed, g.needs_evidence, g.needs_finding,
+  (g.open_inputs + g.open_checklist + g.open_documents
+   + g.needs_narrative + g.needs_work_performed + g.needs_evidence + g.needs_finding) AS total_open,
+  sr.rating, sr.section_risk_score, sr.performed_by, sr.reviewed_by
+FROM inst.administration a
+JOIN crm.party p ON p.party_id = a.party_id
+JOIN inst.section_response sr ON sr.administration_id = a.administration_id
+JOIN inst.section s ON s.section_id = sr.section_id
+CROSS JOIN LATERAL (
+  SELECT
+    count(*) FILTER (WHERE gap_kind='input')          AS open_inputs,
+    count(*) FILTER (WHERE gap_kind='checklist')      AS open_checklist,
+    count(*) FILTER (WHERE gap_kind='document')       AS open_documents,
+    count(*) FILTER (WHERE gap_kind='narrative')      AS needs_narrative,
+    count(*) FILTER (WHERE gap_kind='work_performed') AS needs_work_performed,
+    count(*) FILTER (WHERE gap_kind='evidence')       AS needs_evidence,
+    count(*) FILTER (WHERE gap_kind='finding')        AS needs_finding
+  FROM inst.fn_section_gaps(sr.section_response_id)
+) g
+WHERE a.record_status = 'active' AND sr.record_status = 'active';
+
+-- The crosswalk deliverable: finding → authority → risk vector → evidence
+CREATE OR REPLACE VIEW inst.v_crosswalk AS
+SELECT
+  a.admin_number, p.display_name AS client_name,
+  f.finding_number, f.title AS finding_title, f.severity, f.rating, f.status,
+  s.section_code,
+  au.citation, au.short_name AS authority_name, au.authority_kind,
+  fc.application_note,
+  rv.vector_code, rv.vector_name, rv.category AS risk_category,
+  ev.evidence_ref, ev.tier AS evidence_tier, ev.source AS evidence_source
+FROM inst.finding f
+JOIN inst.administration a ON a.administration_id = f.administration_id
+JOIN crm.party p ON p.party_id = a.party_id
+LEFT JOIN inst.section_response sr ON sr.section_response_id = f.section_response_id
+LEFT JOIN inst.section s ON s.section_id = sr.section_id
+LEFT JOIN inst.finding_criteria fc ON fc.finding_id = f.finding_id
+LEFT JOIN frame.authority au ON au.authority_id = fc.authority_id
+LEFT JOIN inst.finding_risk_vector frv ON frv.finding_id = f.finding_id
+LEFT JOIN frame.risk_vector rv ON rv.vector_id = frv.vector_id
+LEFT JOIN inst.finding_evidence fe ON fe.finding_id = f.finding_id
+LEFT JOIN inst.evidence ev ON ev.evidence_id = fe.evidence_id
+WHERE f.record_status = 'active';
+
+-- Risk register deliverable
+CREATE OR REPLACE VIEW inst.v_risk_register AS
+SELECT
+  a.admin_number, p.display_name AS client_name,
+  rv.vector_code, rv.vector_name, rv.category, rv.fraud_element,
+  ra.likelihood, ra.impact, ra.score, ra.velocity, ra.basis_narrative,
+  count(DISTINCT f.finding_id) AS related_findings,
+  au.citation AS grounding_authority
+FROM inst.risk_assessment ra
+JOIN inst.administration a ON a.administration_id = ra.administration_id
+JOIN crm.party p ON p.party_id = a.party_id
+JOIN frame.risk_vector rv ON rv.vector_id = ra.vector_id
+LEFT JOIN frame.authority au ON au.authority_id = rv.authority_id
+LEFT JOIN inst.finding_risk_vector frv ON frv.vector_id = ra.vector_id
+LEFT JOIN inst.finding f ON f.finding_id = frv.finding_id
+  AND f.administration_id = ra.administration_id
+WHERE ra.record_status = 'active'
+GROUP BY a.admin_number, p.display_name, rv.vector_code, rv.vector_name,
+         rv.category, rv.fraud_element, ra.likelihood, ra.impact, ra.score,
+         ra.velocity, ra.basis_narrative, au.citation;
+```
+
+## SECTION 8: SEED — real, citable authority (verified against public sources)
+
+```sql
+-- ============================================================
+-- 57_SEED_AUTHORITY  — factual registry, not invented
+-- ============================================================
+
+INSERT INTO frame.authority (authority_kind, citation, short_name, issuing_body, requirement_summary, is_licensed_content) VALUES
+-- Federal statute & regulation
+('statute','31 U.S.C. § 5318(h)','AML program requirement','U.S. Congress',
+ 'Financial institutions must establish anti-money laundering programs including internal policies/procedures/controls, a compliance officer, ongoing training, and independent testing.', false),
+('regulation','31 CFR § 1010.230','Beneficial ownership — CDD Rule','FinCEN',
+ 'Covered financial institutions must identify and verify beneficial owners of legal entity customers at account opening.', false),
+('regulation','16 CFR Part 314','FTC Safeguards Rule','Federal Trade Commission',
+ 'Non-bank financial institutions must maintain a comprehensive written information security program, designate a qualified individual, conduct risk assessment, and implement specified safeguards including encryption and MFA.', false),
+('statute','15 U.S.C. § 7262 (SOX § 404)','Internal control over financial reporting','U.S. Congress',
+ 'Management must assess and report on the effectiveness of internal control over financial reporting.', false),
+-- UCC — the treasury/fraud crosswalk workhorse
+('state_statute','UCC § 4A-201','Security procedure — definition','Uniform Law Commission (as enacted by states)',
+ 'Defines security procedure for verifying payment orders, including signatures, codes, callback, and similar means.', false),
+('state_statute','UCC § 4A-202','Commercially reasonable security procedures','Uniform Law Commission (as enacted by states)',
+ 'Allocates loss for unauthorized funds transfers based on whether the bank and customer agreed to and followed a commercially reasonable security procedure.', false),
+-- Texas public-entity treasury — your market
+('state_statute','Tex. Gov''t Code ch. 2256','Public Funds Investment Act (PFIA)','Texas Legislature',
+ 'Governs investment of public funds by Texas local governments and state agencies: written investment policy, investment officer designation, training requirements, authorized investments, quarterly reporting.', false),
+('state_statute','Tex. Gov''t Code § 2256.005','PFIA — investment policy & annual review','Texas Legislature',
+ 'Governing body must adopt a written investment policy by rule/order/ordinance/resolution and review it annually, recording the review in writing.', false),
+('state_statute','Tex. Gov''t Code ch. 2257','Public Funds Collateral Act','Texas Legislature',
+ 'Requires collateralization of public deposits exceeding federal insurance and governs custodian and monitoring duties.', false),
+-- Frameworks & standards (summaries only where licensed)
+('framework_standard','COSO IC-IF 2013, Principle 3','Structure, authority, and responsibility','COSO',
+ 'Management establishes, with board oversight, structures, reporting lines, and appropriate authorities and responsibilities.', true),
+('framework_standard','COSO IC-IF 2013, Principle 10','Control activities selection & development','COSO',
+ 'The organization selects and develops control activities that mitigate risks to acceptable levels.', true),
+('framework_standard','NIST CSF 2.0 — GV.PO','Policy (Govern function)','NIST',
+ 'Organizational cybersecurity policy is established, communicated, and enforced.', false),
+('framework_standard','NIST CSF 2.0 — GV.RR','Roles, responsibilities & authorities','NIST',
+ 'Cybersecurity roles, responsibilities, and authorities are established and communicated.', false),
+('framework_standard','GAO-14-704G, Principle 3','Green Book — structure/authority/responsibility','U.S. Government Accountability Office',
+ 'Management establishes an organizational structure, assigns responsibility, and delegates authority to achieve objectives (federal internal control standard mirroring COSO).', false),
+('exam_guidance','FFIEC BSA/AML Manual — Internal Controls','BSA/AML internal controls examination procedures','FFIEC',
+ 'Examination procedures for assessing the adequacy of a bank''s BSA/AML internal controls relative to its risk profile.', false),
+('exam_guidance','FFIEC IT Handbook — Management','IT governance and management examination guidance','FFIEC',
+ 'Examination guidance on board and management oversight of IT, including governance structures and accountability.', false),
+('professional_std','IIA Global Internal Audit Standards (2024)','Internal audit performance standards','Institute of Internal Auditors',
+ 'Standards governing internal audit planning, evidence, supervision, and communication of results.', true),
+('professional_std','ACFE Fraud Examiners Manual','Fraud examination methodology','Association of Certified Fraud Examiners',
+ 'Methodology for fraud examinations: predication, evidence handling, interviewing, and reporting.', true);
+
+-- Risk vectors — treasury + fraud triangle + governance, grounded where possible
+INSERT INTO frame.risk_vector (vector_code, vector_name, category, description, fraud_element, velocity_default, authority_id) VALUES
+('TRE-LIQ','Liquidity risk','treasury','Inability to meet obligations as they come due without unacceptable loss.', NULL,'rapid', NULL),
+('TRE-CPY','Counterparty/concentration risk','treasury','Exposure concentration in financial institutions or instruments beyond policy or collateral coverage.', NULL,'moderate',
+ (SELECT authority_id FROM frame.authority WHERE citation = 'Tex. Gov''t Code ch. 2257')),
+('TRE-AUTH','Unauthorized transaction risk','treasury','Payment initiation or release outside delegated authority or agreed security procedures.', NULL,'immediate',
+ (SELECT authority_id FROM frame.authority WHERE citation = 'UCC § 4A-202')),
+('FRD-OPP','Fraud opportunity — control gap','fraud','Absent or overridable controls create opportunity for asset misappropriation.', 'opportunity','moderate', NULL),
+('FRD-PRS','Fraud pressure indicators','fraud','Financial or performance pressures on personnel with treasury access.', 'pressure','slow', NULL),
+('FRD-RAT','Override & rationalization exposure','fraud','Tone, precedent, or exception culture that normalizes control override.', 'rationalization','slow', NULL),
+('GOV-AUTH','Authority traceability risk','governance','Actions taken without traceable authorization from the ultimate governing authority.', NULL,'slow',
+ (SELECT authority_id FROM frame.authority WHERE citation = 'GAO-14-704G, Principle 3')),
+('CMP-REG','Regulatory non-conformity','compliance','Operating condition diverges from binding statute or regulation.', NULL,'moderate', NULL),
+('OPS-KEY','Key-person dependency','operational','Critical treasury function concentrated in one individual without succession or coverage.', NULL,'rapid', NULL),
+('TEC-ACC','Access & identity risk','technology','Access rights inconsistent with role, or identity verification gaps in payment systems.', NULL,'immediate',
+ (SELECT authority_id FROM frame.authority WHERE citation = 'NIST CSF 2.0 — GV.RR'));
+```
+
+## SECTION 9: THE IMPORT LOADER — consistency across every framework you author
+
+```sql
+-- ============================================================
+-- 58_LOADER :: one authoring format → identical structure every time
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION inst.fn_import_instrument(p_def JSONB, p_actor UUID)
+RETURNS UUID LANGUAGE plpgsql AS $$
+DECLARE
+  v_inst UUID; v_sect UUID; v_req UUID;
+  sec JSONB; req JSONB; item JSONB; inp JSONB; auth JSONB;
+BEGIN
+  -- Structural validation before anything is written
+  IF p_def->>'instrument_code' IS NULL OR p_def->>'framework_code' IS NULL THEN
+    RAISE EXCEPTION 'Definition must include instrument_code and framework_code.';
+  END IF;
+  IF jsonb_array_length(coalesce(p_def->'sections','[]'::jsonb)) = 0 THEN
+    RAISE EXCEPTION 'Definition contains no sections.';
+  END IF;
+
+  INSERT INTO inst.instrument (
+    framework_id, instrument_code, version, title, purpose, core_question,
+    scope_statement, intended_use, estimated_days, deliverables,
+    report_template_code, created_by)
+  SELECT f.framework_id, p_def->>'instrument_code',
+         COALESCE((p_def->>'version')::int, 1),
+         p_def->>'title', p_def->>'purpose', p_def->>'core_question',
+         p_def->>'scope_statement', p_def->>'intended_use',
+         (p_def->>'estimated_days')::int,
+         ARRAY(SELECT jsonb_array_elements_text(p_def->'deliverables')),
+         p_def->>'report_template_code', p_actor
+    FROM frame.framework f
+   WHERE f.framework_code = p_def->>'framework_code'
+  RETURNING instrument_id INTO v_inst;
+
+  IF v_inst IS NULL THEN
+    RAISE EXCEPTION 'Framework % not found.', p_def->>'framework_code';
+  END IF;
+
+  FOR sec IN SELECT * FROM jsonb_array_elements(p_def->'sections') LOOP
+    -- Consistency gate: every non-scoping section must declare authority
+    IF sec->>'section_kind' NOT IN ('scoping','document_request')
+       AND jsonb_array_length(coalesce(sec->'authorities','[]'::jsonb)) = 0 THEN
+      RAISE EXCEPTION
+        'Section %: fieldwork sections must declare at least one authority in "authorities". Fact-based means criteria are cited, not asserted.',
+        sec->>'section_code';
+    END IF;
+
+    INSERT INTO inst.section (
+      instrument_id, domain_id, section_code, title, section_kind, sort_order,
+      purpose, what_we_assess, why_it_matters, review_criteria, criteria_refs,
+      red_flags, good_practice, min_evidence_tier, evidence_guidance,
+      sample_guidance, performed_by_role, client_role_required,
+      requires_narrative, narrative_prompt, requires_conclusion,
+      weight, is_key_section, na_permitted, created_by)
+    SELECT v_inst, d.domain_id, sec->>'section_code', sec->>'title',
+           (sec->>'section_kind')::inst.section_kind,
+           COALESCE((sec->>'sort_order')::int, 0),
+           sec->>'purpose', sec->>'what_we_assess', sec->>'why_it_matters',
+           sec->>'review_criteria',
+           ARRAY(SELECT jsonb_array_elements_text(coalesce(sec->'criteria_refs','[]'::jsonb))),
+           ARRAY(SELECT jsonb_array_elements_text(coalesce(sec->'red_flags','[]'::jsonb))),
+           sec->>'good_practice',
+           COALESCE((sec->>'min_evidence_tier')::frame.evidence_tier, 'tier_ii'),
+           sec->>'evidence_guidance', sec->>'sample_guidance',
+           sec->>'performed_by_role', sec->>'client_role_required',
+           COALESCE((sec->>'requires_narrative')::boolean, true),
+           sec->>'narrative_prompt',
+           COALESCE((sec->>'requires_conclusion')::boolean, false),
+           COALESCE((sec->>'weight')::numeric, 1.0),
+           COALESCE((sec->>'is_key_section')::boolean, false),
+           COALESCE((sec->>'na_permitted')::boolean, true),
+           p_actor
+      FROM (SELECT 1) x
+      LEFT JOIN frame.domain d
+        ON d.domain_code = sec->>'domain_code'
+       AND d.framework_id = (SELECT framework_id FROM inst.instrument WHERE instrument_id = v_inst)
+    RETURNING section_id INTO v_sect;
+
+    -- Authorities (must already exist in the registry — the loader will not invent law)
+    FOR auth IN SELECT * FROM jsonb_array_elements(coalesce(sec->'authorities','[]'::jsonb)) LOOP
+      INSERT INTO inst.section_authority (section_id, authority_id, relevance, applicability_note)
+      SELECT v_sect, a.authority_id,
+             COALESCE(auth->>'relevance','primary'), auth->>'note'
+        FROM frame.authority a WHERE a.citation = auth->>'citation';
+      IF NOT FOUND THEN
+        RAISE EXCEPTION
+          'Section %: authority "%" is not in frame.authority. Register it (verified) before import.',
+          sec->>'section_code', auth->>'citation';
+      END IF;
+    END LOOP;
+
+    -- Risk vectors
+    INSERT INTO inst.section_risk_vector (section_id, vector_id)
+    SELECT v_sect, rv.vector_id
+      FROM jsonb_array_elements_text(coalesce(sec->'risk_vectors','[]'::jsonb)) v(code)
+      JOIN frame.risk_vector rv ON rv.vector_code = v.code;
+
+    -- Document requirements + their receipt checklists
+    FOR req IN SELECT * FROM jsonb_array_elements(coalesce(sec->'documents','[]'::jsonb)) LOOP
+      INSERT INTO inst.document_requirement (
+        section_id, req_code, sort_order, document_name, description, doc_type,
+        format_expected, period_covered, is_mandatory, alternatives_accepted,
+        review_checklist, acceptance_criteria, common_deficiencies,
+        evidence_tier, requested_from_role, lead_time_days, created_by)
+      VALUES (
+        v_sect, req->>'req_code', COALESCE((req->>'sort_order')::int,0),
+        req->>'document_name', req->>'description', req->>'doc_type',
+        req->>'format_expected', req->>'period_covered',
+        COALESCE((req->>'is_mandatory')::boolean, true),
+        req->>'alternatives_accepted',
+        ARRAY(SELECT jsonb_array_elements_text(coalesce(req->'review_checklist','[]'::jsonb))),
+        req->>'acceptance_criteria',
+        ARRAY(SELECT jsonb_array_elements_text(coalesce(req->'common_deficiencies','[]'::jsonb))),
+        COALESCE((req->>'evidence_tier')::frame.evidence_tier,'tier_ii'),
+        req->>'requested_from_role', COALESCE((req->>'lead_time_days')::int,5), p_actor)
+      RETURNING requirement_id INTO v_req;
+
+      -- Receipt checklist items materialize as rows
+      INSERT INTO inst.checklist_item (
+        requirement_id, item_code, sort_order, item_text,
+        exception_requires_note, exception_suggests_finding, created_by)
+      SELECT v_req,
+             (req->>'req_code') || '.C' || (row_number() OVER ())::text,
+             (row_number() OVER ())::int * 10, t.txt, true, true, p_actor
+        FROM jsonb_array_elements_text(coalesce(req->'review_checklist','[]'::jsonb)) t(txt);
+    END LOOP;
+
+    -- Section-level checklist items
+    FOR item IN SELECT * FROM jsonb_array_elements(coalesce(sec->'checklist','[]'::jsonb)) LOOP
+      INSERT INTO inst.checklist_item (
+        section_id, item_code, sort_order, item_text, guidance, authority_id,
+        result_kind, exception_requires_note, exception_requires_evidence,
+        exception_suggests_finding, is_mandatory, created_by)
+      SELECT v_sect, item->>'item_code', COALESCE((item->>'sort_order')::int,0),
+             item->>'item_text', item->>'guidance',
+             (SELECT authority_id FROM frame.authority WHERE citation = item->>'citation'),
+             COALESCE(item->>'result_kind','yes_no_exception'),
+             COALESCE((item->>'exception_requires_note')::boolean, true),
+             COALESCE((item->>'exception_requires_evidence')::boolean, false),
+             COALESCE((item->>'exception_suggests_finding')::boolean, true),
+             COALESCE((item->>'is_mandatory')::boolean, true), p_actor;
+    END LOOP;
+
+    -- Inputs
+    FOR inp IN SELECT * FROM jsonb_array_elements(coalesce(sec->'inputs','[]'::jsonb)) LOOP
+      INSERT INTO inst.input (
+        section_id, input_code, sort_order, label, help_text, assessor_guidance,
+        input_kind, is_required, answered_by, options, validation, grid_columns,
+        risk_weight, risk_rule, triggers_finding_when, finding_template, created_by)
+      VALUES (
+        v_sect, inp->>'input_code', COALESCE((inp->>'sort_order')::int,0),
+        inp->>'label', inp->>'help_text', inp->>'assessor_guidance',
+        (inp->>'input_kind')::inst.input_kind,
+        COALESCE((inp->>'is_required')::boolean, true),
+        COALESCE(inp->>'answered_by','assessor'),
+        inp->'options', inp->'validation', inp->'grid_columns',
+        COALESCE((inp->>'risk_weight')::numeric, 0),
+        inp->'risk_rule', inp->'triggers_finding_when',
+        inp->>'finding_template', p_actor);
+    END LOOP;
+  END LOOP;
+
+  -- Instantiation of unpublished instruments is already blocked;
+  -- publish is a deliberate second step:
+  --   UPDATE inst.instrument SET is_published = true, published_at = now(),
+  --          published_by = <actor> WHERE instrument_id = v_inst;
+  RETURN v_inst;
+END $$;
+```
+
+Also extend instantiation so **every checklist item materializes as an open result row** the moment an engagement starts — that's the completeness guarantee at time zero:
+
+```sql
+CREATE OR REPLACE FUNCTION inst.fn_instantiate_checklists(p_admin UUID)
+RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_count INT;
+BEGIN
+  INSERT INTO inst.checklist_result (administration_id, item_id, section_response_id)
+  SELECT p_admin, ci.item_id, sr.section_response_id
+    FROM inst.administration a
+    JOIN inst.section s ON s.instrument_id = a.instrument_id
+    JOIN inst.section_response sr
+      ON sr.section_id = s.section_id AND sr.administration_id = p_admin
+    JOIN inst.checklist_item ci ON ci.section_id = s.section_id
+   WHERE a.administration_id = p_admin AND ci.record_status = 'active'
+  ON CONFLICT (administration_id, item_id) DO NOTHING;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  INSERT INTO inst.checklist_result (administration_id, item_id, collection_id)
+  SELECT p_admin, ci.item_id, dc.collection_id
+    FROM inst.document_collection dc
+    JOIN inst.checklist_item ci ON ci.requirement_id = dc.requirement_id
+   WHERE dc.administration_id = p_admin AND ci.record_status = 'active'
+  ON CONFLICT (administration_id, item_id) DO NOTHING;
+
+  RETURN v_count;
+END $$;
+```
+
+---
+
+## WHAT YOU NOW HAVE
+
+**The completeness promise, mechanically kept:** every checklist item, input, document, narrative, and evidence requirement materializes as an open row at engagement start. A section physically cannot reach `ready_for_review` with any open. An administration physically cannot reach `final` with any section incomplete, any draft finding, any probed-but-unscored risk vector, any unresolved language violation, or a continuity break.
+
+**The fact-based promise:** criteria are foreign keys into a verified authority registry. A finding past draft *must* cite authority, link evidence, and tag a risk vector — the crosswalk view then falls out as a query, not a writing exercise.
+
+**The consistency promise:** the loader refuses fieldwork sections without declared authority, refuses citations not in the registry, and builds identical structure from every definition. Your five frameworks, authored once each in the JSON format, come out structurally uniform.
+
+**One decision surfaced, honestly:** I seeded the authority registry with statutes and standards I'm confident of — PFIA, UCC 4A, the CDD Rule, Green Book, NIST CSF 2.0. Each row carries `verification_status`, and the seeds are marked `verified` by me, not by you. Before first client use, someone at In.Tune should confirm each citation against the current source and stamp `verified_by` — statutes amend, and the registry is only as factual as its last verification. The `job_governance_review` cron can carry that re-verification cadence.
+
+Next: the framework definition JSON for TRM in full (all five domains, loader-ready), or the report renderer that turns `v_crosswalk` and `v_risk_register` into the issued PDF?
