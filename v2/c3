@@ -1,0 +1,584 @@
+This diagram is a good pattern, and I want to make sure I map it correctly before writing 2,000 lines against a wrong assumption.
+
+**What the pattern is:** one canonical identity table that is the *only* writer of the identity PK. Every other domain — CRM, financials, clinical, RCM, HR — holds `FK patient_id` and contributes rows, never owns identity. PHI-bearing domains live in physically segregated schemas behind that same FK. It's a hub-and-spoke with a hard rule: *the spokes never mint an ID, and segregation is enforced at the schema boundary, not by convention.*
+
+**Applied to In.Tune, the hub is `crm.client`** — or rather, it should be, and right now it isn't quite. In what I built, `client_id` is the hub PK and `intake`, `engage`, `frame`, `docs` all FK to it correctly. But `crm.beneficial_owner` carries `ssn_enc`/`passport_enc`/`dob` directly on a hub-adjacent table, which is the equivalent of putting clinical notes on the patient row. That's the thing this diagram is telling me to fix: sensitive-attribute tables belong in a segregated schema with their own RLS, their own retention, their own access log — reachable only by FK.
+
+Before I rewrite it, three things I genuinely can't infer, and one of them I asked last turn and haven't gotten:
+
+**1. Is the hub `client` (an entity) or does it need a `party` supertype?** Your schema has `entity_type` including `'individual'`, and separately has `crm.contact` (people) and `crm.beneficial_owner` (people). That's three tables that can each represent a human being, and none of them can be joined to each other. In the patient model there's one PERSON. If a beneficial owner of Client A is also the signatory contact at Client B, today you have two unrelated rows and your sanctions screening hits them independently. A `crm.party` supertype (party → party_individual / party_organization) fixes that and is what the diagram's discipline actually implies. It's also a significant refactor. Do you want it?
+
+**2. Is this healthcare?** The uploaded diagram is patient/PHI/RCM. Your In.Tune capability statement is governance/treasury/PKI — no healthcare. But image 2 in your earlier uploads is an In.Tune-branded medical practice advisory deck with clinical documentation and revenue cycle. So: is the ERP serving a healthcare line of business that needs actual PHI segregation and HIPAA controls, or did you upload this purely as a *structural* reference and there's no PHI anywhere in scope?
+
+That answer changes whether I write a `phi` schema with BAA-grade controls, or whether I take the segregation pattern and apply it to your sensitive data (SSN/EIN/SAR/privileged notes) instead.
+
+**3. Still open from last turn:** who are the KYC subjects — your own clients as engagement acceptance, or your clients' customers as a program you run? I can't write `intake.form_template` field sets without it, and it also determines whether `intake.sar_case` belongs in the model at all.
+
+Give me those three and I'll produce the full restructure in one pass: hub-and-spoke ERD, the segregated-schema DDL, the RLS boundary per spoke, and the migration path from what's already built. If you'd rather I just pick defaults and go, say so and I'll take `party` supertype = yes, PHI = no (pattern only), KYC = client acceptance — and flag every assumption inline so you can correct cheaply.
+Got it — the diagram is a **pattern**, not a healthcare requirement. Adopting it for In.Tune.
+
+## THE ADAPTATION
+
+| Patient model | In.Tune model |
+|---|---|
+| PATIENT (hub, only writer of ID) | **PARTY** (hub, only writer of party_id) |
+| Clinical Encounters (PHI · segregated) | **`sensitive` schema** — SSN/EIN/passport, SAR, privileged notes |
+| CRM / Relationship (contributes, not owns) | `crm` — roles, addresses, relationships |
+| Financials / GL | `engage` + `bill` — engagements, time, AR |
+| ERP / HR Assign. | `core` — user linkage, staff assignment |
+| RCM / Refunds (PHI · segregated) | **`sensitive.screening`** — sanctions/PEP results |
+
+The structural rule I'm enforcing: **only `crm.party` mints a party_id.** Every spoke FKs to it. Nothing sensitive lives on the hub. The `sensitive` schema is physically separate with its own RLS, its own access log, its own retention clock, and no grant to the default app role.
+
+---
+
+## SECTION 1: THE HUB
+
+```
+                    ┌──────────────────────────┐
+                    │  sensitive.identifier    │  ← segregated
+                    │  FK party_id · encrypted │
+                    └────────────┬─────────────┘
+                                 │ N
+                                 │
+   ┌──────────────┐              │ 1              ┌──────────────┐
+   │ crm.party_   │  N      ┌────┴─────┐      N   │ engage.      │
+   │ role         ├─────────┤  PARTY   ├──────────┤ engagement   │
+   │ contributes  │         │ party_id │          │ many rows    │
+   └──────────────┘         │   (PK)   │          └──────────────┘
+                            │ identity │
+   ┌──────────────┐  N      │  + name  │      N   ┌──────────────┐
+   │ core.        ├─────────┤  only    ├──────────┤ sensitive.   │
+   │ app_user     │         │ writer   │          │ screening_*  │ ← segregated
+   └──────────────┘         └────┬─────┘          └──────────────┘
+                                 │ N
+                            ┌────┴─────────────┐
+                            │ sensitive.       │  ← segregated
+                            │ privileged_note  │
+                            └──────────────────┘
+```
+
+```sql
+-- ============================================================
+-- 20_PARTY :: HUB-AND-SPOKE RESTRUCTURE
+-- ============================================================
+
+CREATE SCHEMA IF NOT EXISTS sensitive;
+CREATE SCHEMA IF NOT EXISTS bill;
+
+COMMENT ON SCHEMA sensitive IS
+  'Segregated schema. Encrypted identifiers, screening results, SAR, privileged
+   notes. Separate RLS. Separate retention. NOT granted to intune_app by default.';
+
+-- ---------- ENUMS ----------
+CREATE TYPE crm.party_kind AS ENUM ('individual','organization');
+
+CREATE TYPE crm.role_kind AS ENUM (
+  'client',              -- engaged entity
+  'prospect',
+  'contact',             -- person at an org
+  'beneficial_owner',
+  'control_person',
+  'signatory',
+  'vendor',
+  'counterparty',
+  'staff',               -- In.Tune personnel
+  'regulator',
+  'referral_source'
+);
+
+-- ============================================================
+-- THE HUB — only writer of party_id
+-- ============================================================
+CREATE TABLE crm.party (
+  party_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  party_number  TEXT NOT NULL UNIQUE,
+  party_kind    crm.party_kind NOT NULL,
+
+  -- Resolved display identity. NOT authoritative detail — see subtype tables.
+  display_name  TEXT NOT NULL,
+  search_name   TEXT GENERATED ALWAYS AS (lower(display_name)) STORED,
+
+  -- Deduplication / entity resolution
+  match_key     TEXT,          -- blind index over normalized name+jurisdiction
+  merged_into   UUID REFERENCES crm.party(party_id),
+  merged_at     TIMESTAMPTZ,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'draft',
+
+  CONSTRAINT ck_no_self_merge CHECK (merged_into IS NULL OR merged_into <> party_id)
+);
+CREATE INDEX ix_party_tenant   ON crm.party (tenant_id, record_status);
+CREATE INDEX ix_party_name_trgm ON crm.party USING gin (display_name gin_trgm_ops);
+CREATE INDEX ix_party_match    ON crm.party (match_key) WHERE merged_into IS NULL;
+CREATE INDEX ix_party_kind     ON crm.party (party_kind, record_status);
+
+COMMENT ON TABLE crm.party IS
+  'HUB. The single source of party identity. Only this table mints party_id.
+   Spokes reference it; they never create identity. Contains no sensitive
+   attributes — those live in the sensitive schema behind this FK.';
+
+-- ---------- SUBTYPE: ORGANIZATION ----------
+CREATE TABLE crm.party_organization (
+  party_id        UUID PRIMARY KEY REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  legal_name      TEXT NOT NULL,
+  dba_name        TEXT,
+  entity_type     TEXT NOT NULL CHECK (entity_type IN
+                  ('corporation','llc','llp','partnership','sole_prop','nonprofit',
+                   'government','trust','estate','other')),
+  jurisdiction    TEXT,
+  formation_date  DATE,
+  duns_number     TEXT,
+  cage_code       TEXT,
+  uei_number      TEXT,
+  naics_codes     TEXT[],
+  website         TEXT,
+  industry_sector TEXT,
+  is_regulated    BOOLEAN NOT NULL DEFAULT false,
+  regulators      TEXT[],
+  is_public_company BOOLEAN NOT NULL DEFAULT false,
+  ticker_symbol   TEXT,
+  employee_count  INT,
+  annual_revenue_band TEXT CHECK (annual_revenue_band IN
+                  ('under_1m','1m_10m','10m_50m','50m_250m','250m_1b','over_1b')),
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+-- EIN lives in sensitive.identifier. Not here. Deliberately.
+
+-- ---------- SUBTYPE: INDIVIDUAL ----------
+CREATE TABLE crm.party_individual (
+  party_id     UUID PRIMARY KEY REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  first_name   TEXT NOT NULL,
+  middle_name  TEXT,
+  last_name    TEXT NOT NULL,
+  suffix       TEXT,
+  preferred_name TEXT,
+  birth_year   INT CHECK (birth_year BETWEEN 1900 AND 2100),  -- full DOB is sensitive
+  nationality  CHAR(2),
+  country_of_residence CHAR(2),
+  is_pep       BOOLEAN NOT NULL DEFAULT false,
+  pep_category TEXT CHECK (pep_category IN
+               ('domestic','foreign','international_org','family_member','close_associate')),
+  pep_position TEXT,
+  pep_since    DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_indiv_pep ON crm.party_individual (is_pep) WHERE is_pep;
+
+-- Subtype exclusivity: a party is exactly one kind
+CREATE OR REPLACE FUNCTION crm.fn_enforce_subtype()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_kind crm.party_kind;
+BEGIN
+  SELECT party_kind INTO v_kind FROM crm.party WHERE party_id = NEW.party_id;
+  IF TG_TABLE_NAME = 'party_organization' AND v_kind <> 'organization' THEN
+    RAISE EXCEPTION 'party % is kind=% but an organization subtype row was inserted',
+      NEW.party_id, v_kind;
+  ELSIF TG_TABLE_NAME = 'party_individual' AND v_kind <> 'individual' THEN
+    RAISE EXCEPTION 'party % is kind=% but an individual subtype row was inserted',
+      NEW.party_id, v_kind;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_subtype_org BEFORE INSERT OR UPDATE ON crm.party_organization
+  FOR EACH ROW EXECUTE FUNCTION crm.fn_enforce_subtype();
+CREATE TRIGGER trg_subtype_ind BEFORE INSERT OR UPDATE ON crm.party_individual
+  FOR EACH ROW EXECUTE FUNCTION crm.fn_enforce_subtype();
+```
+
+---
+
+## SECTION 2: SPOKE — ROLES (contributes, not owns)
+
+This is the piece that solves the problem I flagged: the same human can be a beneficial owner of Client A *and* the signatory at Client B, and now they're one `party_id` that screening hits once.
+
+```sql
+-- ============================================================
+-- 21_PARTY_ROLE
+-- ============================================================
+
+CREATE TABLE crm.party_role (
+  party_role_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_id       UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  role_kind      crm.role_kind NOT NULL,
+
+  -- Context: the role is held *at* / *toward* another party
+  context_party_id UUID REFERENCES crm.party(party_id) ON DELETE CASCADE,
+
+  title          TEXT,
+  is_primary     BOOLEAN NOT NULL DEFAULT false,
+  ownership_pct  NUMERIC(5,2) CHECK (ownership_pct BETWEEN 0 AND 100),
+  ownership_type TEXT CHECK (ownership_type IN ('direct','indirect','beneficial','voting')),
+
+  -- Role-scoped operational fields
+  client_number  TEXT,              -- populated only when role_kind='client'
+  risk_rating    core.risk_rating,
+  relationship_owner UUID REFERENCES core.app_user(user_id),
+  onboarded_at   TIMESTAMPTZ,
+  portal_user_id UUID REFERENCES core.app_user(user_id),
+
+  effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+  effective_to   DATE,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+
+  CONSTRAINT ck_role_not_self CHECK (context_party_id IS NULL OR context_party_id <> party_id),
+  CONSTRAINT ck_role_dates    CHECK (effective_to IS NULL OR effective_to >= effective_from),
+  -- Roles that require a context party
+  CONSTRAINT ck_role_context CHECK (
+    role_kind NOT IN ('contact','beneficial_owner','control_person','signatory')
+    OR context_party_id IS NOT NULL),
+  -- client_number only on client roles, and required there
+  CONSTRAINT ck_client_number CHECK (
+    (role_kind = 'client') = (client_number IS NOT NULL))
+);
+
+CREATE INDEX ix_prole_party   ON crm.party_role (party_id, role_kind);
+CREATE INDEX ix_prole_context ON crm.party_role (context_party_id, role_kind)
+  WHERE record_status = 'active';
+CREATE UNIQUE INDEX uq_prole_client_number ON crm.party_role (client_number)
+  WHERE client_number IS NOT NULL;
+-- One active primary contact per organization
+CREATE UNIQUE INDEX uq_prole_primary_contact
+  ON crm.party_role (context_party_id, role_kind)
+  WHERE is_primary AND role_kind = 'contact' AND record_status = 'active';
+-- Non-overlapping role tenure
+ALTER TABLE crm.party_role ADD CONSTRAINT ex_prole_overlap
+  EXCLUDE USING gist (
+    party_id WITH =,
+    (role_kind::text) WITH =,
+    COALESCE(context_party_id, '00000000-0000-0000-0000-000000000000'::uuid) WITH =,
+    daterange(effective_from, effective_to, '[)') WITH &&
+  ) WHERE (record_status = 'active');
+
+COMMENT ON TABLE crm.party_role IS
+  'SPOKE. Contributes role context to a party; never owns identity.
+   A single party_id may hold many roles across many context parties —
+   e.g. beneficial owner of Client A and signatory at Client B.';
+
+-- Ownership beyond 100% at a given context is a data-integrity failure
+CREATE OR REPLACE FUNCTION crm.fn_check_ownership_total()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_total NUMERIC;
+BEGIN
+  IF NEW.role_kind = 'beneficial_owner' AND NEW.ownership_pct IS NOT NULL THEN
+    SELECT COALESCE(sum(ownership_pct), 0) INTO v_total
+      FROM crm.party_role
+     WHERE context_party_id = NEW.context_party_id
+       AND role_kind = 'beneficial_owner'
+       AND ownership_type = COALESCE(NEW.ownership_type, 'direct')
+       AND record_status = 'active'
+       AND effective_to IS NULL
+       AND party_role_id <> COALESCE(NEW.party_role_id, '00000000-0000-0000-0000-000000000000'::uuid);
+
+    IF v_total + NEW.ownership_pct > 100.01 THEN
+      RAISE EXCEPTION
+        'Beneficial ownership for party % totals %%% with this row; cannot exceed 100%%',
+        NEW.context_party_id, v_total + NEW.ownership_pct;
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_ownership_total
+  BEFORE INSERT OR UPDATE ON crm.party_role
+  FOR EACH ROW EXECUTE FUNCTION crm.fn_check_ownership_total();
+
+-- ---------- ORG-TO-ORG STRUCTURE ----------
+CREATE TABLE crm.party_relationship (
+  relationship_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_party_id UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  child_party_id  UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  relationship_type TEXT NOT NULL CHECK (relationship_type IN
+                    ('parent','subsidiary','affiliate','jv','branch','division')),
+  ownership_pct   NUMERIC(5,2),
+  effective_from  DATE NOT NULL DEFAULT CURRENT_DATE,
+  effective_to    DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_prel_distinct CHECK (parent_party_id <> child_party_id)
+);
+
+-- Cycle prevention — A owns B owns A is a beneficial-ownership fiction
+CREATE OR REPLACE FUNCTION crm.fn_prevent_ownership_cycle()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE v_cycle BOOLEAN;
+BEGIN
+  WITH RECURSIVE ancestry AS (
+    SELECT parent_party_id, child_party_id, 1 AS depth
+      FROM crm.party_relationship
+     WHERE child_party_id = NEW.parent_party_id AND record_status = 'active'
+    UNION ALL
+    SELECT pr.parent_party_id, pr.child_party_id, a.depth + 1
+      FROM crm.party_relationship pr
+      JOIN ancestry a ON pr.child_party_id = a.parent_party_id
+     WHERE pr.record_status = 'active' AND a.depth < 20
+  )
+  SELECT EXISTS (SELECT 1 FROM ancestry WHERE parent_party_id = NEW.child_party_id)
+    INTO v_cycle;
+
+  IF v_cycle THEN
+    RAISE EXCEPTION 'Ownership cycle detected: % cannot be a parent of %',
+      NEW.parent_party_id, NEW.child_party_id;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER trg_no_ownership_cycle
+  BEFORE INSERT OR UPDATE ON crm.party_relationship
+  FOR EACH ROW EXECUTE FUNCTION crm.fn_prevent_ownership_cycle();
+
+-- ---------- CONTACT POINTS ----------
+CREATE TABLE crm.contact_point (
+  contact_point_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_id     UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  point_type   TEXT NOT NULL CHECK (point_type IN ('email','phone','mobile','fax','website')),
+  value        TEXT NOT NULL,
+  label        TEXT,
+  is_primary   BOOLEAN NOT NULL DEFAULT false,
+  is_verified  BOOLEAN NOT NULL DEFAULT false,
+  verified_at  TIMESTAMPTZ,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE UNIQUE INDEX uq_cp_primary ON crm.contact_point (party_id, point_type)
+  WHERE is_primary AND record_status = 'active';
+CREATE INDEX ix_cp_value ON crm.contact_point (lower(value));
+
+CREATE TABLE crm.address (
+  address_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_id     UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  address_type TEXT NOT NULL CHECK (address_type IN
+               ('registered','mailing','physical','billing','other')),
+  line1 TEXT NOT NULL, line2 TEXT,
+  city TEXT NOT NULL, state_province TEXT,
+  postal_code TEXT, country_code CHAR(2) NOT NULL DEFAULT 'US',
+  is_primary   BOOLEAN NOT NULL DEFAULT false,
+  is_verified  BOOLEAN NOT NULL DEFAULT false,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_addr_country ON crm.address (country_code) WHERE record_status = 'active';
+```
+
+---
+
+## SECTION 3: THE SEGREGATED SCHEMA
+
+This is the dashed-green box. Everything here is reachable **only** by `party_id`, has its own RLS, its own access log, and is not granted to the default app role.
+
+```sql
+-- ============================================================
+-- 22_SENSITIVE  (the dashed-green boxes)
+-- ============================================================
+
+CREATE TYPE sensitive.identifier_kind AS ENUM (
+  'ssn','itin','ein','passport','drivers_license','national_id',
+  'bank_account','routing','tax_id_foreign'
+);
+
+CREATE TABLE sensitive.identifier (
+  identifier_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_id      UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  kind          sensitive.identifier_kind NOT NULL,
+
+  value_enc     BYTEA NOT NULL,          -- AES-256-GCM, app-side envelope
+  value_last4   CHAR(4),                 -- display only
+  blind_index   TEXT NOT NULL,           -- HMAC(pepper, normalized) — equality search
+  issuing_country CHAR(2),
+  issuing_authority TEXT,
+  issued_on     DATE,
+  expires_on    DATE,
+
+  verified_at   TIMESTAMPTZ,
+  verified_by   UUID REFERENCES core.app_user(user_id),
+  verification_method TEXT CHECK (verification_method IN
+                ('documentary','non_documentary','third_party','database_check')),
+  source_document_id UUID,
+
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+
+  CONSTRAINT uq_ident_blind UNIQUE (kind, blind_index)
+);
+CREATE INDEX ix_ident_party ON sensitive.identifier (party_id, kind);
+CREATE INDEX ix_ident_blind ON sensitive.identifier (blind_index);
+CREATE INDEX ix_ident_expiry ON sensitive.identifier (expires_on)
+  WHERE record_status = 'active' AND expires_on IS NOT NULL;
+
+COMMENT ON TABLE sensitive.identifier IS
+  'SEGREGATED. Encrypted government/financial identifiers. The hub never
+   stores these. Blind index enables "have we seen this SSN before?" without
+   decryption. Every read is logged to sensitive.access_log.';
+
+-- ---------- FULL DOB (birth_year only on the hub subtype) ----------
+CREATE TABLE sensitive.person_detail (
+  party_id      UUID PRIMARY KEY REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  dob_enc       BYTEA,
+  dob_blind     TEXT,
+  place_of_birth TEXT,
+  mothers_maiden_enc BYTEA,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+
+-- ---------- BANK ACCOUNTS ----------
+CREATE TABLE sensitive.bank_account (
+  bank_account_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  party_id      UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  institution_name TEXT NOT NULL,
+  institution_country CHAR(2),
+  account_nickname TEXT,
+  account_number_enc BYTEA NOT NULL,
+  account_last4 CHAR(4),
+  routing_enc   BYTEA,
+  iban_enc      BYTEA,
+  swift_bic     TEXT,
+  currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+  account_purpose TEXT,
+  opened_on     DATE,
+  closed_on     DATE,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active'
+);
+CREATE INDEX ix_bank_party ON sensitive.bank_account (party_id)
+  WHERE record_status = 'active';
+
+-- Signatory authority: M:N over the hub
+CREATE TABLE sensitive.account_signatory (
+  bank_account_id UUID NOT NULL REFERENCES sensitive.bank_account(bank_account_id) ON DELETE CASCADE,
+  party_id      UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  authority_level TEXT NOT NULL CHECK (authority_level IN ('sole','joint','view_only','initiator','approver')),
+  limit_amount  NUMERIC(14,2),
+  effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+  effective_to   DATE,
+  PRIMARY KEY (bank_account_id, party_id, effective_from)
+);
+
+-- ---------- SCREENING (the RCM/Refunds analogue) ----------
+CREATE TABLE sensitive.screening_run (
+  screening_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  party_id      UUID NOT NULL REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  kyc_case_id   UUID,
+  provider      TEXT NOT NULL,
+  list_type     TEXT NOT NULL CHECK (list_type IN
+                ('sanctions','pep','adverse_media','watchlist','internal','law_enforcement')),
+  search_term   TEXT NOT NULL,
+  search_params JSONB,
+  request_payload  JSONB,
+  response_payload JSONB,
+  hit_count     INT NOT NULL DEFAULT 0,
+  run_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  run_by        UUID REFERENCES core.app_user(user_id),
+  is_automated  BOOLEAN NOT NULL DEFAULT false,
+  provider_ref  TEXT
+);
+CREATE INDEX ix_screen_party ON sensitive.screening_run (party_id, list_type, run_at DESC);
+
+CREATE TABLE sensitive.screening_hit (
+  hit_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  screening_id  UUID NOT NULL REFERENCES sensitive.screening_run(screening_id) ON DELETE CASCADE,
+  party_id      UUID NOT NULL REFERENCES crm.party(party_id),
+  matched_name  TEXT NOT NULL,
+  match_score   NUMERIC(5,2),
+  list_source   TEXT,
+  list_entry_id TEXT,
+  match_details JSONB,
+  disposition   TEXT NOT NULL DEFAULT 'pending'
+                CHECK (disposition IN ('pending','true_match','false_positive','escalated','blocked')),
+  disposition_notes TEXT,
+  dispositioned_by UUID REFERENCES core.app_user(user_id),
+  dispositioned_at TIMESTAMPTZ,
+  reviewed_by   UUID REFERENCES core.app_user(user_id),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Four-eyes on true-match dispositions
+  CONSTRAINT ck_hit_four_eyes CHECK (
+    disposition <> 'true_match' OR reviewed_by IS NULL OR reviewed_by <> dispositioned_by)
+);
+CREATE INDEX ix_hit_pending ON sensitive.screening_hit (disposition, created_at)
+  WHERE disposition = 'pending';
+
+-- ---------- SAR ----------
+CREATE TABLE sensitive.sar_case (
+  sar_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id     UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  party_id      UUID REFERENCES crm.party(party_id),
+  sar_number    TEXT NOT NULL UNIQUE,
+  detected_at   TIMESTAMPTZ NOT NULL,
+  activity_summary TEXT NOT NULL,
+  activity_start DATE, activity_end DATE,
+  aggregate_amount NUMERIC(14,2),
+  status        TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open','investigating','filed','closed_no_file','continuing')),
+  filed_at      TIMESTAMPTZ,
+  fincen_bsa_id TEXT,
+  investigator  UUID REFERENCES core.app_user(user_id),
+  approved_by   UUID REFERENCES core.app_user(user_id),
+  filing_due_at TIMESTAMPTZ GENERATED ALWAYS AS (detected_at + INTERVAL '30 days') STORED,
+  created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_by UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  record_status core.record_status NOT NULL DEFAULT 'active',
+  CONSTRAINT ck_sar_four_eyes CHECK (approved_by IS NULL OR approved_by <> investigator)
+);
+
+-- ---------- PRIVILEGED NOTES ----------
+CREATE TABLE sensitive.privileged_note (
+  note_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   UUID NOT NULL REFERENCES core.tenant(tenant_id),
+  party_id    UUID REFERENCES crm.party(party_id) ON DELETE CASCADE,
+  case_id     UUID,
+  sar_id      UUID REFERENCES sensitive.sar_case(sar_id) ON DELETE CASCADE,
+  note_type   TEXT NOT NULL CHECK (note_type IN
+              ('attorney_client','work_product','investigation','whistleblower','internal_only')),
+  body        TEXT NOT NULL,
+  author_id   UUID NOT NULL REFERENCES core.app_user(user_id),
+  privilege_asserted_by TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------- ACCESS LOG (every read of this schema) ----------
+CREATE TABLE sensitive.access_log (
+  access_id   BIGSERIAL PRIMARY KEY,
+  actor_id    UUID,
+  tenant_id   UUID,
+  party_id    UUID,
+  object_schema TEXT NOT NULL,
+  object_table  TEXT NOT NULL,
+  object_pk     TEXT,
+  action      TEXT NOT NULL CHECK (action IN ('read','decrypt','write','export')),
+  justification TEXT,
+  request_id  TEXT,
+  client_ip   INET,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+) PARTITION BY RANGE (occurred_at);
+
+CREATE INDEX ix_sensaccess_actor ON sensitive.access_log (actor_id, occurred_at DESC);
+CREATE INDEX ix_sensaccess_party ON sensitive.access_log (party_id, occurred_at DESC);
+REVOKE UPDATE, DELETE ON sensitive.access_log FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION sensitive.fn_ensure_access_partitions(p_months INT DEFAULT 3)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE d DATE; nm TEXT;
+BEGIN
+  FOR i IN 0..p_months LOOP
+    d := date_trunc('month', now())::date + (i || ' month')::interval;
+    nm := 'access_log_' || to_char(d,'YYYY_MM');
+    IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = nm) THEN
+      EXECUTE format('CREATE TABLE sensitive.%I PARTITION OF sensitive.access_log
