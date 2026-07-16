@@ -1,0 +1,26 @@
+# 1. Host prep (Ubuntu 24.04 LTS on IONOS VPS)
+apt update && apt upgrade -y
+apt install -y docker.io docker-compose-v2 ufw fail2ban
+ufw default deny incoming && ufw allow 22,80,443/tcp && ufw enable
+
+# 2. Directory structure
+mkdir -p /opt/intune/{sql,certs,secrets,nginx/conf.d,scripts}
+cd /opt/intune
+
+# 3. Load SQL in order
+# 00_foundation.sql → 01_core.sql → 02_crm.sql → 03_intake.sql
+# → 04_engage.sql → 05_frame.sql → 06_docs.sql → 07_portal.sql
+# → 08_kb.sql → 09_gov.sql → 10_rls.sql → 11_rpt.sql
+# → 12_cron.sql → 13_seed.sql → 99_roles.sql
+
+# 4. Secrets
+openssl rand -base64 48 > secrets/pg_password.txt
+chmod 600 secrets/*
+
+# 5. Deploy
+docker compose up -d
+docker compose logs -f postgres
+
+# 6. Initialize backup stanza
+docker exec intune-backup pgbackrest --stanza=intune stanza-create
+docker exec intune-backup pgbackrest --stanza=intune check
